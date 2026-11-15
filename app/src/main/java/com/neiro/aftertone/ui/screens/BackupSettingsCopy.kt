@@ -13,7 +13,7 @@ internal data class BackupRestoreConfirmationCopy(
 internal fun backupRestoreConfirmationCopy(summary: BackupSummary): BackupRestoreConfirmationCopy =
     BackupRestoreConfirmationCopy(
         itemCounts = "${formatTrackCount(summary.trackCount)} · ${formatPlaylistCount(summary.playlistCount)} · ${formatTrackCount(summary.favoriteCount)} в избранном",
-        payloadDescription = "Аудиофайлы и обложки: ${formatBackupBytes(summary.payloadBytes)}",
+        payloadDescription = "Музыка и обложки: ${formatBackupBytes(summary.payloadBytes)} · целостность проверяется при восстановлении",
         replacementWarning = "Медиатека на устройстве будет заменена данными из архива. Текущий трек остановится перед заменой. Старые файлы удалятся только после сохранения восстановленной библиотеки.",
     )
 

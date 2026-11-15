@@ -36,6 +36,35 @@ class RestoreActionGateTest {
     }
 
     @Test
+    fun externalDispatchPermitAdmissionIsLinearizedAgainstRestore() {
+        val gate = RestoreActionGate()
+        gate.unblock()
+        val permit = gate.tryAcquireExternalAudioDispatchPermit()
+            ?: error("An open gate should admit the external dispatch permit.")
+        val restore = gate.beginRestoreOperation()
+        var actionCount = 0
+
+        assertFalse(gate.runIfAllowed { actionCount++ })
+        assertTrue(gate.runIfAllowed(permit) { actionCount++ })
+        assertEquals(1, actionCount)
+        assertNull("Restore admission must reject a new permit.", gate.tryAcquireExternalAudioDispatchPermit())
+
+        permit.close()
+        assertFalse("A closed permit cannot authorize further writes.", gate.runIfAllowed(permit) { actionCount++ })
+        restore.finish()
+        assertFalse(gate.isBlocked)
+
+        val retryPermit = gate.tryAcquireExternalAudioDispatchPermit()
+            ?: error("The retry should acquire a fresh permit after restore finishes.")
+        retryPermit.close()
+
+        val restoreFirst = gate.beginRestoreOperation()
+        assertNull("When restore wins, no dispatch permit may be minted.", gate.tryAcquireExternalAudioDispatchPermit())
+        restoreFirst.finish()
+        assertEquals(1, actionCount)
+    }
+
+    @Test
     fun cancelledRestoreWaitingForRepositoryLockReleasesTheGate() = runBlocking {
         val gate = RestoreActionGate()
         gate.unblock()

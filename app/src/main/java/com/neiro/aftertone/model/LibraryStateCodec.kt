@@ -8,6 +8,7 @@ import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import java.util.Properties
+import java.util.UUID
 import java.util.concurrent.CancellationException
 
 object LibraryStateCodec {
@@ -36,6 +37,19 @@ object LibraryStateCodec {
                 setProperty(prefix + "duration", track.durationMs.coerceAtLeast(0).toString())
                 setProperty(prefix + "file", track.filePath)
                 track.artworkPath?.let { setProperty(prefix + "artwork", it) }
+                track.externalImportRequestId?.let { requestId ->
+                    require(isCanonicalUuid(requestId)) { "The local library contains an invalid external request ID." }
+                    setProperty(prefix + "externalRequestId", requestId)
+                }
+                if (track.externalImportHandoffClaimed) {
+                    setProperty(prefix + "externalHandoffClaimed", "true")
+                }
+                track.externalImportHandoffDispatchStarted?.let { started ->
+                    setProperty(prefix + "externalHandoffDispatchStarted", started.toString())
+                }
+                if (track.externalImportHandoffCompleted) {
+                    setProperty(prefix + "externalHandoffCompleted", "true")
+                }
             }
 
             setProperty("playlists.count", snapshot.playlists.size.toString())
@@ -103,6 +117,24 @@ object LibraryStateCodec {
                     ?: throw IllegalArgumentException("The saved local library contains an invalid duration."),
                 filePath = filePath,
                 artworkPath = properties.getProperty(prefix + "artwork")?.takeIf(String::isNotBlank),
+                externalImportRequestId = properties.getProperty(prefix + "externalRequestId")?.let { requestId ->
+                    require(isCanonicalUuid(requestId)) {
+                        "The saved local library contains an invalid external request ID."
+                    }
+                    requestId
+                },
+                externalImportHandoffClaimed = properties.getProperty(prefix + "externalHandoffClaimed")?.let { value ->
+                    value.toBooleanStrictOrNull()
+                        ?: throw IllegalArgumentException("The saved local library contains an invalid handoff claim state.")
+                } ?: false,
+                externalImportHandoffDispatchStarted = properties.getProperty(prefix + "externalHandoffDispatchStarted")?.let { value ->
+                    value.toBooleanStrictOrNull()
+                        ?: throw IllegalArgumentException("The saved local library contains an invalid handoff dispatch state.")
+                },
+                externalImportHandoffCompleted = properties.getProperty(prefix + "externalHandoffCompleted")?.let { value ->
+                    value.toBooleanStrictOrNull()
+                        ?: throw IllegalArgumentException("The saved local library contains an invalid handoff state.")
+                } ?: false,
             )
         }
 
@@ -179,6 +211,8 @@ object LibraryStateCodec {
             add(track.album)
             add(track.filePath)
             add(track.artworkPath.orEmpty())
+            add(track.externalImportRequestId.orEmpty())
+            if (track.externalImportHandoffDispatchStarted != null) estimate += 64L
         }
         snapshot.playlists.forEach { playlist ->
             estimate += 256L + playlist.trackIds.size * 32L
@@ -196,6 +230,9 @@ object LibraryStateCodec {
 
     private fun Properties.presentValue(key: String): String =
         getProperty(key) ?: throw IllegalArgumentException("The saved local library is missing a required field.")
+
+    private fun isCanonicalUuid(value: String): Boolean =
+        runCatching { UUID.fromString(value).toString() == value }.getOrDefault(false)
 
     private fun Properties.readCount(key: String, maximum: Int): Int {
         val count = getProperty(key)?.toIntOrNull()

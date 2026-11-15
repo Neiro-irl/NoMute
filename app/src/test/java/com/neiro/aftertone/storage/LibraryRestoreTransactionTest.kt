@@ -8,6 +8,9 @@ import com.neiro.aftertone.model.Track
 import java.io.File
 import java.io.IOException
 import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.Path
+import java.nio.file.SecureDirectoryStream
 import java.util.concurrent.CancellationException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -31,6 +34,65 @@ class LibraryRestoreTransactionTest {
             val ownerMarker = File(staging, PrivateAudioPath.restoreOwnerMarkerName())
             assertTrue(ownerMarker.isFile)
             assertEquals(PrivateAudioPath.restoreStageId(staging.name), ownerMarker.readText())
+        } finally {
+            fixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun stagingCleanupDoesNotDeleteContentsFromSameNamedReplacementDirectory() {
+        val fixture = fixture()
+        try {
+            val staging = fixture.transaction().createStagingDirectory()
+            fixture.populateStaging(staging)
+            val originalAudioBytes = File(staging, "restored-1.mp3").readBytes()
+            val id = requireNotNull(PrivateAudioPath.restoreStageId(staging.name))
+            val movedOriginal = File(fixture.root, "moved-original-stage")
+            var replaced = false
+            val swappingStaging = object : File(staging.path) {
+                override fun exists(): Boolean {
+                    val exists = super.exists()
+                    if (exists && !replaced) {
+                        replaced = true
+                        Files.move(staging.toPath(), movedOriginal.toPath())
+                        assertTrue(mkdir())
+                        File(this, PrivateAudioPath.restoreOwnerMarkerName()).writeText(id)
+                        File(this, "restored-1.mp3").writeBytes(byteArrayOf(99, 98, 97))
+                    }
+                    return exists
+                }
+            }
+
+            assertFalse(fixture.transaction().discardStagingDirectory(swappingStaging))
+
+            val replacementTrack = File(staging, "restored-1.mp3")
+            assertTrue("The replacement staging directory must remain for safe retry.", staging.isDirectory)
+            assertTrue("The replacement asset must not be deleted.", replacementTrack.isFile)
+            assertEquals(listOf(99, 98, 97), replacementTrack.readBytes().map(Byte::toInt))
+            assertEquals(
+                "The originally verified asset bytes must survive at their moved path.",
+                originalAudioBytes.toList(),
+                File(movedOriginal, "restored-1.mp3").readBytes().toList(),
+            )
+        } finally {
+            fixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun stagingCleanupResumesAfterAssetWasLeftInDeleteQuarantine() {
+        val fixture = fixture()
+        try {
+            val staging = fixture.transaction().createStagingDirectory()
+            fixture.populateStaging(staging)
+            val audioName = staging.toPath().fileSystem.getPath("restored-1.mp3")
+            val quarantineName = requireNotNull(PrivateAudioPath.deletionQuarantineName(audioName))
+            assertTrue(File(staging, audioName.toString()).delete())
+            File(staging, quarantineName.toString()).writeBytes(byteArrayOf(21, 22, 23))
+
+            assertTrue(fixture.transaction().discardStagingDirectory(staging))
+
+            assertFalse("Cleanup should remove the staging directory after retiring its abandoned quarantine.", staging.exists())
         } finally {
             fixture.root.deleteRecursively()
         }
@@ -65,6 +127,50 @@ class LibraryRestoreTransactionTest {
             assertTrue(fixture.newAudio.isFile)
             assertTrue(fixture.newArtwork.isFile)
             assertEquals(committed.snapshot, fixture.stateStore.read()?.let(LibraryStateCodec::decode))
+        } finally {
+            fixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun replacedTrackCleanupDoesNotDeleteFileFromDirectorySwappedAfterOwnershipCheck() {
+        val fixture = fixture()
+        try {
+            val previousId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+            val previousGeneration = File(fixture.audioDirectory, "restore-$previousId").apply { assertTrue(mkdir()) }
+            File(previousGeneration, PrivateAudioPath.restoreOwnerMarkerName()).writeText(previousId)
+            val previousAudio = File(previousGeneration, "old-1.mp3").apply { writeBytes(byteArrayOf(10, 20, 30)) }
+            val previousArtwork = File(previousGeneration, "old-1.img").apply { writeBytes(byteArrayOf(40, 50)) }
+            val previousSnapshot = fixture.oldSnapshot.copy(
+                tracks = listOf(fixture.oldSnapshot.tracks.single().copy(
+                    filePath = previousAudio.canonicalPath,
+                    artworkPath = previousArtwork.canonicalPath,
+                )),
+            )
+            assertTrue(fixture.stateStore.write(LibraryStateCodec.encode(previousSnapshot)))
+
+            val transaction = fixture.transaction()
+            val staging = transaction.createStagingDirectory()
+            fixture.populateStaging(staging)
+            val pending = transaction.prepareRestore(staging, fixture.preparedBackup())
+            transaction.commitRestore(pending)
+
+            val movedGeneration = File(fixture.root, "moved-old-generation")
+            val swapAfterOwnershipCheck: (File) -> Unit = { directory ->
+                if (directory == previousGeneration) {
+                    Files.move(previousGeneration.toPath(), movedGeneration.toPath())
+                    assertTrue(previousGeneration.mkdir())
+                    File(previousGeneration, "old-1.mp3").writeBytes(byteArrayOf(99, 98, 97))
+                }
+            }
+            val finalizer = fixture.transaction(beforeOpeningParent = swapAfterOwnershipCheck)
+
+            assertEquals(
+                RestoreFinalizationResult.COMMITTED_CLEANUP_PENDING,
+                finalizer.finishRestoreOutcome(pending.transactionId),
+            )
+            assertEquals("The replacement generation's same-named track must not be deleted.", listOf(99, 98, 97), File(previousGeneration, "old-1.mp3").readBytes().map(Byte::toInt))
+            assertTrue("The original generation should remain intact at its moved path.", File(movedGeneration, "old-1.mp3").isFile)
         } finally {
             fixture.root.deleteRecursively()
         }
@@ -218,6 +324,89 @@ class LibraryRestoreTransactionTest {
             assertTrue(unrelated.isFile)
             assertTrue(Files.isSymbolicLink(symlink.toPath()))
             assertEquals("keep", outsideTarget.readText())
+        } finally {
+            fixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun recoveryResumesValidJournalStrandedInDeleteQuarantine() {
+        val fixture = fixture()
+        try {
+            val transaction = fixture.transaction()
+            val staging = transaction.createStagingDirectory()
+            fixture.populateStaging(staging)
+            val pending = transaction.prepareRestore(staging, fixture.preparedBackup())
+            val journal = File(fixture.filesDirectory, ".aftertone-restore-journal")
+            val quarantineName = requireNotNull(PrivateAudioPath.deletionQuarantineName(journal.toPath().fileName))
+            val quarantinedJournal = File(fixture.filesDirectory, quarantineName.toString())
+            Files.move(journal.toPath(), quarantinedJournal.toPath())
+
+            val recoveryId = fixture.transaction().recoverInterruptedRestore()
+
+            assertEquals(null, recoveryId)
+            assertFalse("The quarantined journal should be removed only after rollback cleanup.", quarantinedJournal.exists())
+            assertEquals(fixture.oldEncodedState, fixture.stateStore.read())
+            assertFalse(File(fixture.audioDirectory, "restore-${pending.transactionId}").exists())
+            assertTrue(fixture.oldAudio.isFile)
+        } finally {
+            fixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun recoveryRemovesOrphanJournalTemporaryStrandedInDeleteQuarantine() {
+        val fixture = fixture()
+        try {
+            val temporaryName = ".aftertone-restore-journal-00000000-0000-0000-0000-000000000004"
+            val quarantineName = requireNotNull(
+                PrivateAudioPath.deletionQuarantineName(fixture.filesDirectory.toPath().fileSystem.getPath(temporaryName)),
+            )
+            val quarantinedTemporary = File(fixture.filesDirectory, quarantineName.toString())
+                .apply { writeText("incomplete journal temporary") }
+
+            val recoveryId = fixture.transaction().recoverInterruptedRestore()
+
+            assertEquals(null, recoveryId)
+            assertFalse("The recognized temp quarantine must be cleaned through its pinned parent.", quarantinedTemporary.exists())
+        } finally {
+            fixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun orphanJournalCleanupDoesNotDeleteFileInReplacementFilesDirectory() {
+        val fixture = fixture()
+        try {
+            val name = ".aftertone-restore-journal-00000000-0000-0000-0000-000000000003"
+            File(fixture.filesDirectory, name).writeText("original orphan")
+            val movedFiles = File(fixture.root, "opened-files")
+            val replacementFile = File(fixture.filesDirectory, name)
+            var replaced = false
+            val swappingFilesDirectory = object : File(fixture.filesDirectory.path) {
+                override fun listFiles(): Array<File>? {
+                    val children = super.listFiles()
+                    if (!replaced) {
+                        replaced = true
+                        Files.move(toPath(), movedFiles.toPath())
+                        assertTrue("A same-named replacement directory must be created.", mkdir())
+                        replacementFile.writeText("replacement must survive")
+                    }
+                    return children
+                }
+            }
+            val transaction = LibraryRestoreTransaction(
+                filesDirectory = swappingFilesDirectory,
+                audioDirectory = fixture.audioDirectory,
+                stateStore = fixture.stateStore,
+                decodeSnapshot = { encoded -> encoded?.let(LibraryStateCodec::decode) ?: LibrarySnapshot() },
+            )
+
+            val recoveryId = transaction.recoverInterruptedRestore()
+            assertTrue("Cleanup must not delete a same-named file from the replacement directory.", replacementFile.isFile)
+            assertEquals("replacement must survive", replacementFile.readText(Charsets.UTF_8))
+            assertFalse("The original orphan should be removed through the opened directory handle.", File(movedFiles, name).exists())
+            assertTrue("Cleanup remains pending when the files-directory identity changes.", recoveryId != null)
         } finally {
             fixture.root.deleteRecursively()
         }
@@ -539,6 +728,289 @@ class LibraryRestoreTransactionTest {
     }
 
     @Test
+    fun createStagingDirectoryRemovesEmptyStageWhenInitialParentSyncFails() {
+        val fixture = fixture()
+        try {
+            var failFirstAudioDirectorySync = true
+            val durability = object : RestoreFileDurability {
+                override fun syncFile(output: java.io.FileOutputStream) = output.fd.sync()
+
+                override fun syncDirectory(directory: File) {
+                    if (directory == fixture.audioDirectory && failFirstAudioDirectorySync) {
+                        failFirstAudioDirectorySync = false
+                        throw IOException("Injected initial audio-directory sync failure.")
+                    }
+                    SystemRestoreFileDurability.syncDirectory(directory)
+                }
+            }
+            val transaction = fixture.transaction(durability)
+
+            assertThrows(IOException::class.java) { transaction.createStagingDirectory() }
+            val remainingStages = fixture.audioDirectory.listFiles().orEmpty()
+                .filter { PrivateAudioPath.restoreStageId(it.name) != null }
+            assertTrue(remainingStages.isEmpty())
+
+            assertEquals(null, transaction.recoverInterruptedRestore())
+            assertTrue(fixture.audioDirectory.listFiles().orEmpty().none { PrivateAudioPath.restoreStageId(it.name) != null })
+        } finally {
+            fixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun recoveryRemovesEmptyStagingDirectoryWhenOwnerMarkerWasAlreadyRemoved() {
+        val fixture = fixture()
+        try {
+            val staging = fixture.transaction().createStagingDirectory()
+            val ownerMarker = File(staging, PrivateAudioPath.restoreOwnerMarkerName())
+            assertTrue(ownerMarker.delete())
+
+            assertEquals(null, fixture.transaction().recoverInterruptedRestore())
+            assertFalse(staging.exists())
+        } finally {
+            fixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun recoveryPreservesUnexpectedContentsInMarkerlessStagingDirectory() {
+        val fixture = fixture()
+        try {
+            val staging = fixture.transaction().createStagingDirectory()
+            assertTrue(File(staging, PrivateAudioPath.restoreOwnerMarkerName()).delete())
+            val unexpected = File(staging, "unexpected.bin").apply { writeBytes(byteArrayOf(9, 8, 7)) }
+
+            assertTrue(fixture.transaction().recoverInterruptedRestore() != null)
+            assertTrue(staging.isDirectory)
+            assertTrue(unexpected.isFile)
+            assertEquals(listOf(9, 8, 7), unexpected.readBytes().map(Byte::toInt))
+        } finally {
+            fixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun recoveryRemovesEmptyMarkerlessGenerationAndRetriesAfterParentSyncFailure() {
+        val fixture = fixture()
+        try {
+            var failAudioDirectorySync = false
+            val durability = object : RestoreFileDurability {
+                override fun syncFile(output: java.io.FileOutputStream) = output.fd.sync()
+
+                override fun syncDirectory(directory: File) {
+                    if (failAudioDirectorySync && directory == fixture.audioDirectory) {
+                        throw IOException("Injected markerless generation parent sync failure.")
+                    }
+                    SystemRestoreFileDurability.syncDirectory(directory)
+                }
+            }
+            val transaction = fixture.transaction(durability)
+            val staging = transaction.createStagingDirectory()
+            fixture.populateStaging(staging)
+            val pending = transaction.prepareRestore(staging, fixture.preparedBackup())
+            val generation = File(fixture.audioDirectory, "restore-${pending.transactionId}")
+            assertTrue(File(generation, "restored-1.mp3").delete())
+            assertTrue(File(generation, "restored-1.img").delete())
+            assertTrue(File(generation, PrivateAudioPath.restoreOwnerMarkerName()).delete())
+            assertEquals(0, generation.listFiles()?.size)
+            failAudioDirectorySync = true
+
+            assertEquals(pending.transactionId, fixture.transaction(durability).recoverInterruptedRestore())
+            assertFalse(generation.exists())
+
+            failAudioDirectorySync = false
+            assertEquals(null, fixture.transaction(durability).recoverInterruptedRestore())
+            assertTrue(fixture.oldAudio.isFile)
+            assertTrue(fixture.oldArtwork.isFile)
+        } finally {
+            fixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun markerlessGenerationParentIsSyncedThroughOpenedHandleBeforePathReplacement() {
+        val fixture = fixture()
+        try {
+            val id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+            val generation = File(fixture.audioDirectory, "restore-$id").apply { assertTrue(mkdir()) }
+            val originalAudioDirectoryKey = requireNotNull(
+                PrivateAudioPath.directoryFileKeyNoFollow(fixture.audioDirectory),
+            )
+            val movedAudioDirectory = File(fixture.root, "moved-audio-directory")
+            var pathReplaced = false
+            val swappingAudioDirectory = object : File(fixture.audioDirectory.path) {
+                override fun exists(): Boolean {
+                    val result = super.exists()
+                    if (!pathReplaced && !Files.exists(generation.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+                        pathReplaced = true
+                        Files.move(toPath(), movedAudioDirectory.toPath())
+                        Files.createDirectory(toPath())
+                    }
+                    return result
+                }
+            }
+            var originalParentSyncedAfterDeletion = false
+            val durability = object : RestoreFileDurability {
+                override fun syncFile(output: java.io.FileOutputStream) = output.fd.sync()
+
+                override fun syncDirectory(directory: File) = SystemRestoreFileDurability.syncDirectory(directory)
+
+                override fun syncDirectory(directory: File, openedDirectory: SecureDirectoryStream<Path>) {
+                    if (directory.path == swappingAudioDirectory.path &&
+                        !Files.exists(generation.toPath(), LinkOption.NOFOLLOW_LINKS) &&
+                        PrivateAudioPath.isOpenedDirectoryKey(originalAudioDirectoryKey, openedDirectory)
+                    ) {
+                        originalParentSyncedAfterDeletion = true
+                    }
+                    super<RestoreFileDurability>.syncDirectory(directory, openedDirectory)
+                }
+            }
+            val transaction = LibraryRestoreTransaction(
+                filesDirectory = fixture.filesDirectory,
+                audioDirectory = swappingAudioDirectory,
+                stateStore = fixture.stateStore,
+                durability = durability,
+                decodeSnapshot = { encoded -> encoded?.let(LibraryStateCodec::decode) ?: LibrarySnapshot() },
+            )
+
+            assertEquals(null, transaction.recoverInterruptedRestore())
+            assertTrue(pathReplaced)
+            assertTrue(
+                "The directory entry removal must be synced using the directory handle opened before replacement.",
+                originalParentSyncedAfterDeletion,
+            )
+            assertFalse(File(movedAudioDirectory, generation.name).exists())
+        } finally {
+            fixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun recoveryPreservesUnexpectedContentsInMarkerlessGeneration() {
+        val fixture = fixture()
+        try {
+            val transaction = fixture.transaction()
+            val staging = transaction.createStagingDirectory()
+            fixture.populateStaging(staging)
+            val pending = transaction.prepareRestore(staging, fixture.preparedBackup())
+            val generation = File(fixture.audioDirectory, "restore-${pending.transactionId}")
+            assertTrue(File(generation, "restored-1.mp3").delete())
+            assertTrue(File(generation, "restored-1.img").delete())
+            assertTrue(File(generation, PrivateAudioPath.restoreOwnerMarkerName()).delete())
+            val unexpected = File(generation, "unexpected.bin").apply { writeBytes(byteArrayOf(9, 8, 7)) }
+
+            assertEquals(pending.transactionId, transaction.recoverInterruptedRestore())
+            assertEquals(pending.transactionId, transaction.recoverInterruptedRestore())
+            assertTrue(generation.isDirectory)
+            assertEquals(listOf(9, 8, 7), unexpected.readBytes().map(Byte::toInt))
+            assertTrue(fixture.oldAudio.isFile)
+            assertTrue(fixture.oldArtwork.isFile)
+        } finally {
+            fixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun recoveryPreservesMarkerlessGenerationSymlinkAndItsTarget() {
+        val fixture = fixture()
+        try {
+            val transaction = fixture.transaction()
+            val staging = transaction.createStagingDirectory()
+            fixture.populateStaging(staging)
+            val pending = transaction.prepareRestore(staging, fixture.preparedBackup())
+            val generation = File(fixture.audioDirectory, "restore-${pending.transactionId}")
+            assertTrue(File(generation, "restored-1.mp3").delete())
+            assertTrue(File(generation, "restored-1.img").delete())
+            assertTrue(File(generation, PrivateAudioPath.restoreOwnerMarkerName()).delete())
+            assertTrue(generation.delete())
+            val outside = File(fixture.root, "outside-generation").apply { mkdir() }
+            val outsideFile = File(outside, "unexpected.bin").apply { writeBytes(byteArrayOf(4, 5, 6)) }
+            Files.createSymbolicLink(generation.toPath(), outside.toPath())
+
+            assertEquals(pending.transactionId, transaction.recoverInterruptedRestore())
+            assertEquals(pending.transactionId, transaction.recoverInterruptedRestore())
+            assertTrue(Files.isSymbolicLink(generation.toPath()))
+            assertEquals(listOf(4, 5, 6), outsideFile.readBytes().map(Byte::toInt))
+        } finally {
+            fixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun recoveryRemovesEmptyMarkerlessPreviousGenerationAfterOwnerMarkerWasRemoved() {
+        val fixture = fixture()
+        try {
+            val previousId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+            val previousGeneration = File(fixture.audioDirectory, "restore-$previousId").apply { assertTrue(mkdir()) }
+            val previousMarker = File(previousGeneration, PrivateAudioPath.restoreOwnerMarkerName()).apply { writeText(previousId) }
+            val previousAudio = File(previousGeneration, "old-1.mp3").apply { writeBytes(byteArrayOf(11, 12, 13)) }
+            val previousArtwork = File(previousGeneration, "old-1.img").apply { writeBytes(byteArrayOf(14, 15)) }
+            val previousSnapshot = fixture.oldSnapshot.copy(
+                tracks = fixture.oldSnapshot.tracks.map {
+                    it.copy(filePath = previousAudio.canonicalPath, artworkPath = previousArtwork.canonicalPath)
+                },
+            )
+            assertTrue(fixture.stateStore.write(LibraryStateCodec.encode(previousSnapshot)))
+
+            val transaction = fixture.transaction()
+            val staging = transaction.createStagingDirectory()
+            fixture.populateStaging(staging)
+            val pending = transaction.prepareRestore(staging, fixture.preparedBackup())
+            transaction.commitRestore(pending)
+            assertTrue(previousAudio.delete())
+            assertTrue(previousArtwork.delete())
+            assertTrue(previousMarker.delete())
+            assertEquals(0, previousGeneration.listFiles()?.size)
+
+            assertEquals(null, fixture.transaction().recoverInterruptedRestore())
+
+            assertFalse(previousGeneration.exists())
+            assertTrue(File(pending.snapshot.tracks.single().filePath).isFile)
+            assertTrue(File(pending.snapshot.tracks.single().artworkPath!!).isFile)
+            assertEquals(pending.encodedState, fixture.stateStore.read())
+        } finally {
+            fixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun recoveryPreservesUnexpectedContentsInMarkerlessPreviousGeneration() {
+        val fixture = fixture()
+        try {
+            val previousId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+            val previousGeneration = File(fixture.audioDirectory, "restore-$previousId").apply { assertTrue(mkdir()) }
+            val previousMarker = File(previousGeneration, PrivateAudioPath.restoreOwnerMarkerName()).apply { writeText(previousId) }
+            val previousAudio = File(previousGeneration, "old-1.mp3").apply { writeBytes(byteArrayOf(11, 12, 13)) }
+            val previousArtwork = File(previousGeneration, "old-1.img").apply { writeBytes(byteArrayOf(14, 15)) }
+            val previousSnapshot = fixture.oldSnapshot.copy(
+                tracks = fixture.oldSnapshot.tracks.map {
+                    it.copy(filePath = previousAudio.canonicalPath, artworkPath = previousArtwork.canonicalPath)
+                },
+            )
+            assertTrue(fixture.stateStore.write(LibraryStateCodec.encode(previousSnapshot)))
+
+            val transaction = fixture.transaction()
+            val staging = transaction.createStagingDirectory()
+            fixture.populateStaging(staging)
+            val pending = transaction.prepareRestore(staging, fixture.preparedBackup())
+            transaction.commitRestore(pending)
+            assertTrue(previousAudio.delete())
+            assertTrue(previousArtwork.delete())
+            assertTrue(previousMarker.delete())
+            val unexpected = File(previousGeneration, "unexpected.bin").apply { writeBytes(byteArrayOf(7, 8, 9)) }
+
+            assertEquals(pending.transactionId, fixture.transaction().recoverInterruptedRestore())
+            assertEquals(pending.transactionId, fixture.transaction().recoverInterruptedRestore())
+
+            assertTrue(previousGeneration.isDirectory)
+            assertEquals(listOf(7, 8, 9), unexpected.readBytes().map(Byte::toInt))
+            assertTrue(File(pending.snapshot.tracks.single().filePath).isFile)
+        } finally {
+            fixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun recoveryReportsPendingUntilRollbackGenerationCleanupCanBeRetried() {
         val fixture = fixture()
         try {
@@ -733,6 +1205,7 @@ class LibraryRestoreTransactionTest {
             playlists = listOf(Playlist("old-mix", "Старый список", listOf("old-1"))),
             favoriteTrackIds = setOf("old-1"),
         )
+        val oldEncodedState = LibraryStateCodec.encode(oldSnapshot)
         val newAudio = byteArrayOf(1, 2, 3, 4)
         val newArtwork = byteArrayOf(5, 6, 7)
         val portableSnapshot = LibrarySnapshot(
@@ -747,11 +1220,11 @@ class LibraryRestoreTransactionTest {
             oldAudio = oldAudio,
             oldArtwork = oldArtwork,
             oldSnapshot = oldSnapshot,
-            oldEncodedState = LibraryStateCodec.encode(oldSnapshot),
+            oldEncodedState = oldEncodedState,
             newAudioBytes = newAudio,
             newArtworkBytes = newArtwork,
             portableSnapshot = portableSnapshot,
-            stateStore = MemoryLibraryStateStore(LibraryStateCodec.encode(oldSnapshot)),
+            stateStore = MemoryLibraryStateStore(oldEncodedState),
         )
     }
 
@@ -772,12 +1245,16 @@ class LibraryRestoreTransactionTest {
         val newAudio: File get() = newGeneration.takeIf(File::exists)?.let { File(it, "restored-1.mp3") } ?: File(audioDirectory, "restore-missing/restored-1.mp3")
         val newArtwork: File get() = File(newAudio.parentFile, "restored-1.img")
 
-        fun transaction(durability: RestoreFileDurability = SystemRestoreFileDurability) = LibraryRestoreTransaction(
+        fun transaction(
+            durability: RestoreFileDurability = SystemRestoreFileDurability,
+            beforeOpeningParent: (File) -> Unit = {},
+        ) = LibraryRestoreTransaction(
             filesDirectory = filesDirectory,
             audioDirectory = audioDirectory,
             stateStore = stateStore,
             durability = durability,
             decodeSnapshot = ::decodeAndValidate,
+            beforeOpeningPreviousFileDirectory = beforeOpeningParent,
         )
 
         fun populateStaging(staging: File) {

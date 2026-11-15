@@ -54,6 +54,7 @@ fun SearchScreen(
     onToggleFavorite: (String) -> Unit,
     onAddToCollection: (String) -> Unit,
     onRemoveFromDevice: (Track) -> Unit,
+    onChooseArtwork: (String) -> Unit,
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     val results = filterLocalTracks(library.tracks, query)
@@ -127,6 +128,7 @@ fun SearchScreen(
                             onToggleFavorite = { onToggleFavorite(track.id) },
                             onAddToCollection = { onAddToCollection(track.id) },
                             onRemoveFromDevice = { onRemoveFromDevice(track) },
+                            onChooseArtwork = onChooseArtwork,
                         )
                         HorizontalDivider(color = AftertoneOutline.copy(alpha = 0.72f), thickness = 0.6.dp)
                     }
@@ -154,6 +156,7 @@ fun SearchScreen(
                             onToggleFavorite = { onToggleFavorite(track.id) },
                             onAddToCollection = { onAddToCollection(track.id) },
                             onRemoveFromDevice = { onRemoveFromDevice(track) },
+                            onChooseArtwork = onChooseArtwork,
                         )
                         HorizontalDivider(color = AftertoneOutline.copy(alpha = 0.72f), thickness = 0.6.dp)
                     }

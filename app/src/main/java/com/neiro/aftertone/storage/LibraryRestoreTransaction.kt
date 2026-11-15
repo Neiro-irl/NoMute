@@ -4,16 +4,25 @@ import com.neiro.aftertone.model.LibrarySnapshot
 import com.neiro.aftertone.model.LibraryStateCodec
 import com.neiro.aftertone.model.PrivateAudioPath
 import com.neiro.aftertone.model.Track
+import com.neiro.aftertone.model.TrackArtworkFileName
 import com.neiro.aftertone.model.TrackFileName
+import java.io.ByteArrayInputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.File
+import java.io.FilterOutputStream
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
 import java.nio.ByteBuffer
+import java.nio.channels.Channels
 import java.nio.file.Files
 import java.nio.file.LinkOption
+import java.nio.file.NoSuchFileException
+import java.nio.file.Path
+import java.nio.file.SecureDirectoryStream
+import java.nio.file.StandardOpenOption
+import java.nio.file.attribute.BasicFileAttributeView
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
@@ -69,6 +78,7 @@ internal class LibraryRestoreTransaction(
     private val audioDirectory: File,
     private val stateStore: LibraryStateStore,
     private val durability: RestoreFileDurability = SystemRestoreFileDurability,
+    private val beforeOpeningPreviousFileDirectory: (File) -> Unit = {},
     private val decodeSnapshot: (String?) -> LibrarySnapshot,
 ) {
     fun createStagingDirectory(): File {
@@ -270,7 +280,8 @@ internal class LibraryRestoreTransaction(
         requireSafeAudioDirectory()
         val journal = readJournal()
         if (journal == null) {
-            return if (retryAbandonedRecoveryCleanup(forceSyncDirectories = false)) {
+            // A successful unlink followed by a failed parent fsync leaves no candidate to rediscover.
+            return if (retryAbandonedRecoveryCleanup(forceSyncDirectories = true)) {
                 null
             } else {
                 ORPHAN_CLEANUP_PENDING_ID
@@ -314,6 +325,7 @@ internal class LibraryRestoreTransaction(
         val previous = journal.previousEncodedState?.let { LibraryStateCodec.decode(it) } ?: LibrarySnapshot()
         val current = decodeSnapshot(journal.encodedState)
         if (!isCommittedGenerationValid(journal, current)) return@runCatching false
+        if (!cleanupEmptyPreviousGenerations(previous)) return@runCatching false
         if (!cleanupReplacedFiles(previous, current)) return@runCatching false
         cleanupEmptyPreviousGenerations(previous)
     }.getOrDefault(false)
@@ -428,31 +440,71 @@ internal class LibraryRestoreTransaction(
 
     private fun cleanupReplacedFiles(previous: LibrarySnapshot, current: LibrarySnapshot): Boolean {
         val currentPaths = current.tracks.flatMap { track -> listOfNotNull(track.filePath, track.artworkPath) }.toSet()
-        val changedDirectories = linkedSetOf<File>()
-        previous.tracks.forEach { track ->
-            val audio = File(track.filePath)
-            if (track.filePath !in currentPaths) {
-                if (!isOwnedPreviousTrackAudio(track, audio)) return false
-                val parent = audio.parentFile ?: return false
-                changedDirectories += if (isMissingPreviousGenerationDirectory(parent)) audioDirectory else parent
-                if (audio.exists() && !audio.delete()) return false
+        val changedDirectories = linkedMapOf<File, SecureDirectoryStream<Path>>()
+        try {
+            previous.tracks.forEach { track ->
+                val audio = File(track.filePath)
+                if (track.filePath !in currentPaths) {
+                    if (!deleteOwnedPreviousFile(audio, { isOwnedPreviousTrackAudio(track, audio) }, changedDirectories)) return false
+                }
+                val artwork = track.artworkPath?.let(::File)
+                if (artwork != null && artwork.path !in currentPaths) {
+                    if (!deleteOwnedPreviousFile(artwork, { isOwnedPreviousTrackArtwork(track, artwork) }, changedDirectories)) return false
+                }
             }
-            val artwork = track.artworkPath?.let(::File)
-            if (artwork != null && artwork.path !in currentPaths) {
-                if (!isOwnedPreviousTrackArtwork(track, artwork)) return false
-                val parent = artwork.parentFile ?: return false
-                changedDirectories += if (isMissingPreviousGenerationDirectory(parent)) audioDirectory else parent
-                if (artwork.exists() && !artwork.delete()) return false
+            changedDirectories.forEach { (directory, openedDirectory) ->
+                if (!syncDirectoryIfPresent(directory, openedDirectory)) return false
             }
+            return true
+        } catch (_: Exception) {
+            return false
+        } finally {
+            changedDirectories.values.forEach { opened -> runCatching { opened.close() } }
         }
-        changedDirectories.forEach { directory ->
-            if (!syncDirectoryIfPresent(directory)) return false
+    }
+
+    private fun deleteOwnedPreviousFile(
+        file: File,
+        ownershipCheck: () -> Boolean,
+        changedDirectories: MutableMap<File, SecureDirectoryStream<Path>>,
+    ): Boolean {
+        val parent = file.parentFile ?: return false
+        val missingParent = isMissingPreviousGenerationDirectory(parent)
+        val directory = if (missingParent) audioDirectory else parent
+        val expectedDirectoryKey = PrivateAudioPath.directoryFileKeyNoFollow(directory) ?: return false
+        val expectedFileKey = if (missingParent) null else PrivateAudioPath.regularFileKeyNoFollow(file.toPath())
+        if (!ownershipCheck()) return false
+
+        beforeOpeningPreviousFileDirectory(directory)
+        val openedDirectory = changedDirectories.getOrPut(directory) {
+            PrivateAudioPath.openDirectoryNoFollow(directory)
+        }
+        if (!PrivateAudioPath.isOpenedDirectoryKey(expectedDirectoryKey, openedDirectory) ||
+            !PrivateAudioPath.isSameDirectory(directory, openedDirectory)
+        ) return false
+
+        if (directory == parent) {
+            val generationId = PrivateAudioPath.restoreGenerationId(parent.name)
+            if (generationId != null && !PrivateAudioPath.hasExpectedDirectChildContentsNoFollow(
+                    openedDirectory,
+                    directory.toPath().fileSystem.getPath(PrivateAudioPath.restoreOwnerMarkerName()),
+                    generationId,
+                )
+            ) return false
+
+            val childName = directory.toPath().fileSystem.getPath(file.name)
+            val currentFileKey = PrivateAudioPath.regularFileKeyNoFollow(openedDirectory, childName)
+            if (expectedFileKey != null) {
+                if (currentFileKey != expectedFileKey) return false
+            } else if (hasEntryNoFollow(openedDirectory, childName)) {
+                return false
+            }
+            if (!PrivateAudioPath.deleteRegularFileNoFollow(openedDirectory, childName, expectedFileKey)) return false
         }
         return true
     }
 
     private fun cleanupEmptyPreviousGenerations(previous: LibrarySnapshot): Boolean {
-        var changed = false
         val directories = previous.tracks.flatMap { track ->
             listOfNotNull(File(track.filePath).parentFile, track.artworkPath?.let { File(it).parentFile })
         }.distinct()
@@ -466,17 +518,15 @@ internal class LibraryRestoreTransaction(
                 ) return false
                 return@forEach
             }
-            if (!PrivateAudioPath.isOwnedRestoreDirectory(audioDirectory, directory, id)) return false
+            if (!PrivateAudioPath.isOwnedRestoreDirectory(audioDirectory, directory, id)) {
+                if (!deleteEmptyMarkerlessGenerationDirectory(directory, id)) return false
+                return@forEach
+            }
             val children = directory.listFiles()?.toList() ?: return false
             if (children.size == 1 && children.single().name == OWNER_MARKER) {
-                val marker = children.single()
-                if (!isOwnedMarker(directory, marker, id) || !marker.delete() || !PrivateAudioPath.isDirectChild(audioDirectory, directory) || !directory.delete()) {
-                    return false
-                }
-                changed = true
+                if (!deleteEmptyOwnedGenerationDirectory(directory, id)) return false
             }
         }
-        if (changed && runCatching { durability.syncDirectory(audioDirectory) }.isFailure) return false
         return true
     }
 
@@ -487,10 +537,65 @@ internal class LibraryRestoreTransaction(
                 isMissingPreviousGenerationDirectory(file.parentFile))
 
     private fun isOwnedPreviousTrackArtwork(track: Track, file: File): Boolean =
-        file.name == "${track.id}.img" &&
+        TrackArtworkFileName.isGeneratedFileName(track.id, file.name) &&
             (PrivateAudioPath.isDirectChild(audioDirectory, file) ||
                 PrivateAudioPath.isOwnedRestoreFile(audioDirectory, file) ||
                 isMissingPreviousGenerationDirectory(file.parentFile))
+
+    private fun isEmptyDirectory(directory: SecureDirectoryStream<Path>): Boolean = !directory.iterator().hasNext()
+
+    private fun deleteEmptyMarkerlessGenerationDirectory(directory: File, id: String): Boolean = try {
+        if (PrivateAudioPath.restoreGenerationId(directory.name) != id) return false
+        val expectedAudioKey = PrivateAudioPath.directoryFileKeyNoFollow(audioDirectory) ?: return false
+        val expectedGenerationKey = PrivateAudioPath.directoryFileKeyNoFollow(directory) ?: return false
+        if (!PrivateAudioPath.isDirectChild(audioDirectory, directory)) return false
+        val directoryName = audioDirectory.toPath().fileSystem.getPath(directory.name)
+        PrivateAudioPath.openDirectoryNoFollow(audioDirectory).use { audioHandle ->
+            if (!PrivateAudioPath.isOpenedDirectoryKey(expectedAudioKey, audioHandle) ||
+                !PrivateAudioPath.isSameDirectory(audioDirectory, audioHandle)
+            ) return false
+            audioHandle.newDirectoryStream(directoryName, LinkOption.NOFOLLOW_LINKS).use { generationHandle ->
+                if (!PrivateAudioPath.isOpenedDirectoryKey(expectedGenerationKey, generationHandle) ||
+                    !PrivateAudioPath.isSameDirectory(directory, generationHandle)
+                ) return false
+                if (!isEmptyDirectory(generationHandle)) return false
+                audioHandle.deleteDirectory(directoryName)
+                if (!syncDirectoryIfPresent(audioDirectory, audioHandle)) return false
+            }
+        }
+        true
+    } catch (_: Exception) {
+        false
+    }
+
+    private fun deleteEmptyOwnedGenerationDirectory(directory: File, id: String): Boolean = try {
+        if (PrivateAudioPath.restoreGenerationId(directory.name) != id) return false
+        val expectedAudioKey = PrivateAudioPath.directoryFileKeyNoFollow(audioDirectory) ?: return false
+        val expectedGenerationKey = PrivateAudioPath.directoryFileKeyNoFollow(directory) ?: return false
+        if (!PrivateAudioPath.isDirectChild(audioDirectory, directory)) return false
+        val directoryName = audioDirectory.toPath().fileSystem.getPath(directory.name)
+        val markerName = audioDirectory.toPath().fileSystem.getPath(OWNER_MARKER)
+        PrivateAudioPath.openDirectoryNoFollow(audioDirectory).use { audioHandle ->
+            if (!PrivateAudioPath.isOpenedDirectoryKey(expectedAudioKey, audioHandle) ||
+                !PrivateAudioPath.isSameDirectory(audioDirectory, audioHandle)
+            ) return false
+            audioHandle.newDirectoryStream(directoryName, LinkOption.NOFOLLOW_LINKS).use { generationHandle ->
+                if (!PrivateAudioPath.isOpenedDirectoryKey(expectedGenerationKey, generationHandle) ||
+                    !PrivateAudioPath.isSameDirectory(directory, generationHandle)
+                ) return false
+                val children = generationHandle.map { it.fileName?.toString() ?: return false }.toList()
+                if (children.size != 1 || children.single() != OWNER_MARKER ||
+                    !PrivateAudioPath.hasExpectedDirectChildContentsNoFollow(generationHandle, markerName, id)
+                ) return false
+                generationHandle.deleteFile(markerName)
+                audioHandle.deleteDirectory(directoryName)
+                if (!syncDirectoryIfPresent(audioDirectory, audioHandle)) return false
+            }
+        }
+        true
+    } catch (_: Exception) {
+        false
+    }
 
     private fun isMissingPreviousGenerationDirectory(directory: File?): Boolean {
         if (directory == null || PrivateAudioPath.restoreGenerationId(directory.name) == null) return false
@@ -503,7 +608,7 @@ internal class LibraryRestoreTransaction(
             (PrivateAudioPath.isDirectChild(audioDirectory, file) || PrivateAudioPath.isOwnedRestoreFile(audioDirectory, file))
 
     private fun isOwnedTrackArtwork(track: Track, file: File): Boolean =
-        file.name == "${track.id}.img" &&
+        TrackArtworkFileName.isGeneratedFileName(track.id, file.name) &&
             (PrivateAudioPath.isDirectChild(audioDirectory, file) || PrivateAudioPath.isOwnedRestoreFile(audioDirectory, file))
 
     private fun writeOwnerMarker(directory: File, id: String) {
@@ -518,47 +623,114 @@ internal class LibraryRestoreTransaction(
     }
 
     private fun writeJournal(pending: PendingLibraryRestore) {
-        if (!filesDirectory.isDirectory || !PrivateAudioPath.isDirectChild(filesDirectory, journalFile) || journalFile.exists()) {
+        if (!filesDirectory.isDirectory || !PrivateAudioPath.isCanonicalDirectory(filesDirectory)) {
             throw IOException("A previous restore transaction needs recovery.")
         }
-        val temporary = File(filesDirectory, "$JOURNAL_TEMP_PREFIX${pending.transactionId}")
-        if (!PrivateAudioPath.isDirectChild(filesDirectory, temporary) || !temporary.createNewFile()) {
-            throw IOException("Could not create the restore recovery journal.")
-        }
-        try {
-            FileOutputStream(temporary).use { fileOutput ->
-                val output = DataOutputStream(fileOutput)
-                output.writeInt(JOURNAL_MAGIC)
-                output.writeInt(JOURNAL_VERSION)
-                output.writeUTF(pending.transactionId)
-                output.writeUTF(pending.stagingDirectory.name)
-                output.writeUTF(pending.generationDirectory.name)
-                writeNullableState(output, pending.previousEncodedState)
-                writeRequiredState(output, pending.encodedState)
-                output.writeInt(pending.integrity.size)
-                pending.integrity.forEach { asset ->
-                    output.writeUTF(asset.fileName)
-                    output.writeLong(asset.sizeBytes)
-                    output.writeUTF(asset.sha256)
-                }
-                output.flush()
-                durability.syncFile(fileOutput)
+        val fileSystem = filesDirectory.toPath().fileSystem
+        val journalName = fileSystem.getPath(journalFile.name)
+        val temporaryName = fileSystem.getPath("$JOURNAL_TEMP_PREFIX${pending.transactionId}")
+        PrivateAudioPath.openDirectoryNoFollow(filesDirectory).use { filesHandle ->
+            if (!PrivateAudioPath.isSameDirectory(filesDirectory, filesHandle) ||
+                hasEntryNoFollow(filesHandle, journalName) || hasEntryNoFollow(filesHandle, temporaryName)
+            ) {
+                throw IOException("A previous restore transaction needs recovery.")
             }
-            if (!temporary.renameTo(journalFile)) throw IOException("Could not publish the restore recovery journal.")
-            durability.syncDirectory(filesDirectory)
-        } catch (error: Exception) {
-            if (temporary.isFile && PrivateAudioPath.isDirectChild(filesDirectory, temporary)) temporary.delete()
-            throw error
+            var temporaryCreated = false
+            try {
+                val channel = filesHandle.newByteChannel(
+                    temporaryName,
+                    setOf(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS),
+                )
+                temporaryCreated = true
+                channel.use { openedChannel ->
+                    val fileChannel = openedChannel as? java.nio.channels.FileChannel
+                        ?: throw IOException("The secure filesystem did not provide a durable journal channel.")
+                    val output = DataOutputStream(object : FilterOutputStream(Channels.newOutputStream(openedChannel)) {
+                        override fun close() = flush()
+                    })
+                    output.writeInt(JOURNAL_MAGIC)
+                    output.writeInt(JOURNAL_VERSION)
+                    output.writeUTF(pending.transactionId)
+                    output.writeUTF(pending.stagingDirectory.name)
+                    output.writeUTF(pending.generationDirectory.name)
+                    writeNullableState(output, pending.previousEncodedState)
+                    writeRequiredState(output, pending.encodedState)
+                    output.writeInt(pending.integrity.size)
+                    pending.integrity.forEach { asset ->
+                        output.writeUTF(asset.fileName)
+                        output.writeLong(asset.sizeBytes)
+                        output.writeUTF(asset.sha256)
+                    }
+                    output.flush()
+                    durability.syncFile(fileChannel)
+                }
+                filesHandle.move(temporaryName, filesHandle, journalName)
+                temporaryCreated = false
+                durability.syncDirectory(filesDirectory, filesHandle)
+            } catch (error: Exception) {
+                if (temporaryCreated) {
+                    runCatching { PrivateAudioPath.deleteRegularFileNoFollow(filesHandle, temporaryName) }
+                        .onFailure(error::addSuppressed)
+                }
+                runCatching { durability.syncDirectory(filesDirectory, filesHandle) }
+                    .onFailure(error::addSuppressed)
+                throw error
+            }
         }
     }
 
     private fun readJournal(): RestoreJournal? {
-        if (!journalFile.exists()) return null
-        if (!PrivateAudioPath.isDirectChild(filesDirectory, journalFile) || !journalFile.isFile || journalFile.length() !in 1..MAX_JOURNAL_BYTES) {
-            throw IOException("The restore recovery journal could not be verified.")
-        }
         return try {
-            DataInputStream(FileInputStream(journalFile)).use { input ->
+            if (!filesDirectory.isDirectory || !PrivateAudioPath.isCanonicalDirectory(filesDirectory)) {
+                throw IOException("The restore recovery journal could not be verified.")
+            }
+            PrivateAudioPath.openDirectoryNoFollow(filesDirectory).use { filesHandle ->
+                if (!PrivateAudioPath.isSameDirectory(filesDirectory, filesHandle)) {
+                    throw IOException("The restore recovery journal directory changed.")
+                }
+                readJournal(filesHandle)
+            }
+        } catch (error: IOException) {
+            throw error
+        } catch (error: Exception) {
+            throw IOException("The restore recovery journal is incomplete.", error)
+        }
+    }
+
+    private fun readJournal(filesHandle: SecureDirectoryStream<Path>): RestoreJournal? {
+        val journalName = filesDirectory.toPath().fileSystem.getPath(journalFile.name)
+        val journal = readJournal(filesHandle, journalName)
+        if (journal != null) return journal
+        val quarantineName = PrivateAudioPath.deletionQuarantineName(journalName) ?: return null
+        if (!hasEntryNoFollow(filesHandle, quarantineName)) return null
+        return readJournal(filesHandle, quarantineName)
+    }
+
+    private fun readJournal(filesHandle: SecureDirectoryStream<Path>, journalName: Path): RestoreJournal? {
+        val channel = try {
+            filesHandle.newByteChannel(journalName, setOf(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS))
+        } catch (_: NoSuchFileException) {
+            return null
+        }
+        return channel.use { openedChannel ->
+            val fileChannel = openedChannel as? java.nio.channels.FileChannel
+                ?: throw IOException("The secure filesystem did not provide a readable journal channel.")
+            val attributes = filesHandle.getFileAttributeView(
+                journalName,
+                BasicFileAttributeView::class.java,
+                LinkOption.NOFOLLOW_LINKS,
+            )?.readAttributes() ?: throw IOException("The restore recovery journal could not be verified.")
+            val size = attributes.size()
+            if (!attributes.isRegularFile || size !in 1..MAX_JOURNAL_BYTES || fileChannel.size() != size) {
+                throw IOException("The restore recovery journal could not be verified.")
+            }
+            val bytes = ByteBuffer.allocate(size.toInt())
+            while (bytes.hasRemaining()) {
+                val count = openedChannel.read(bytes)
+                if (count <= 0) throw IOException("The restore recovery journal is incomplete.")
+            }
+            if (fileChannel.size() != size) throw IOException("The restore recovery journal changed while being read.")
+            DataInputStream(ByteArrayInputStream(bytes.array())).use { input ->
                 if (input.readInt() != JOURNAL_MAGIC || input.readInt() != JOURNAL_VERSION) {
                     throw IOException("The restore recovery journal version is unsupported.")
                 }
@@ -595,22 +767,27 @@ internal class LibraryRestoreTransaction(
                 if (input.available() != 0) throw IOException("The restore recovery journal contains unexpected data.")
                 RestoreJournal(transactionId, stagingName, generationName, previous, encoded, integrity)
             }
-        } catch (error: IOException) {
-            throw error
-        } catch (error: Exception) {
-            throw IOException("The restore recovery journal is incomplete.", error)
         }
     }
 
     private fun deleteJournal(transactionId: String): Boolean {
-        val journal = runCatching { readJournal() }.getOrNull()
-        if (journal == null) {
-            if (journalFile.exists() || Files.isSymbolicLink(journalFile.toPath())) return false
-            return syncDirectoryIfPresent(filesDirectory)
+        if (!filesDirectory.isDirectory || !PrivateAudioPath.isCanonicalDirectory(filesDirectory)) return false
+        return try {
+            PrivateAudioPath.openDirectoryNoFollow(filesDirectory).use { filesHandle ->
+                if (!PrivateAudioPath.isSameDirectory(filesDirectory, filesHandle)) return false
+                val journal = readJournal(filesHandle)
+                val journalName = filesDirectory.toPath().fileSystem.getPath(journalFile.name)
+                if (journal == null) {
+                    if (hasEntryNoFollow(filesHandle, journalName)) return false
+                    return syncDirectoryIfPresent(filesDirectory, filesHandle)
+                }
+                if (journal.transactionId != transactionId) return false
+                if (!PrivateAudioPath.deleteRegularFileNoFollow(filesHandle, journalName)) return false
+                syncDirectoryIfPresent(filesDirectory, filesHandle)
+            }
+        } catch (_: Exception) {
+            false
         }
-        if (journal.transactionId != transactionId || !PrivateAudioPath.isDirectChild(filesDirectory, journalFile)) return false
-        if (journalFile.exists() && !journalFile.delete()) return false
-        return syncDirectoryIfPresent(filesDirectory)
     }
 
     private fun requireSafeAudioDirectory() {
@@ -620,48 +797,121 @@ internal class LibraryRestoreTransaction(
     }
 
     private fun cleanupStagingDirectory(directory: File, id: String): Boolean {
+        val expectedDirectoryKey = PrivateAudioPath.directoryFileKeyNoFollow(directory)
         if (!directory.exists()) {
             return !Files.isSymbolicLink(directory.toPath()) && syncDirectoryIfPresent(audioDirectory)
         }
-        if (!isOwnedStagingDirectory(directory, id)) return false
-        return cleanupMarkerOwnedDirectory(directory, id)
+        if (!isOwnedStagingDirectory(directory, id)) return cleanupEmptyMarkerlessStagingDirectory(directory, id)
+        return cleanupMarkerOwnedDirectory(directory, id, expectedDirectoryKey ?: return false)
+    }
+
+    private fun cleanupEmptyMarkerlessStagingDirectory(directory: File, id: String): Boolean {
+        if (PrivateAudioPath.restoreStageId(directory.name) != id ||
+            !PrivateAudioPath.isDirectChild(audioDirectory, directory)
+        ) return false
+        return try {
+            val directoryName = audioDirectory.toPath().fileSystem.getPath(directory.name)
+            PrivateAudioPath.openDirectoryNoFollow(audioDirectory).use { audioHandle ->
+                audioHandle.newDirectoryStream(directoryName, LinkOption.NOFOLLOW_LINKS).use { stagingHandle ->
+                    if (!isEmptyDirectory(stagingHandle)) return false
+                    audioHandle.deleteDirectory(directoryName)
+                }
+                syncDirectoryIfPresent(audioDirectory, audioHandle)
+            }
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun cleanupGenerationDirectory(directory: File, id: String): Boolean {
+        val expectedDirectoryKey = PrivateAudioPath.directoryFileKeyNoFollow(directory)
         if (!directory.exists()) {
             return !Files.isSymbolicLink(directory.toPath()) && syncDirectoryIfPresent(audioDirectory)
         }
-        if (!PrivateAudioPath.isOwnedRestoreDirectory(audioDirectory, directory, id)) return false
-        return cleanupMarkerOwnedDirectory(directory, id)
+        if (!PrivateAudioPath.isOwnedRestoreDirectory(audioDirectory, directory, id)) {
+            return deleteEmptyMarkerlessGenerationDirectory(directory, id) && syncDirectoryIfPresent(audioDirectory)
+        }
+        return cleanupMarkerOwnedDirectory(directory, id, expectedDirectoryKey ?: return false)
     }
 
-    private fun cleanupMarkerOwnedDirectory(directory: File, id: String): Boolean {
+    private fun cleanupMarkerOwnedDirectory(directory: File, id: String, expectedDirectoryKey: Any): Boolean {
         if (!PrivateAudioPath.isDirectChild(audioDirectory, directory)) return false
-        val children = directory.listFiles()?.toList() ?: return false
-        val markers = children.filter { it.name == OWNER_MARKER }
-        if (markers.size != 1) return false
-        val marker = markers.single()
-        if (!isOwnedMarker(directory, marker, id)) return false
-        val assets = children.filterNot { it.name == OWNER_MARKER }
-        if (assets.any { !isSafeStagedAssetName(it.name) || !it.isFile || !PrivateAudioPath.isDirectChild(directory, it) }) {
-            return false
+        return try {
+            val directoryName = audioDirectory.toPath().fileSystem.getPath(directory.name)
+            val markerName = audioDirectory.toPath().fileSystem.getPath(OWNER_MARKER)
+            PrivateAudioPath.openDirectoryNoFollow(audioDirectory).use { audioHandle ->
+                if (!PrivateAudioPath.isSameDirectory(audioDirectory, audioHandle)) return false
+                audioHandle.newDirectoryStream(directoryName, LinkOption.NOFOLLOW_LINKS).use { openedDirectory ->
+                    if (!PrivateAudioPath.isOpenedDirectoryKey(expectedDirectoryKey, openedDirectory) ||
+                        !PrivateAudioPath.isSameDirectory(directory, openedDirectory)
+                    ) return false
+                    if (!PrivateAudioPath.hasExpectedDirectChildContentsNoFollow(openedDirectory, markerName, id)) return false
+                    val childNames = openedDirectory.map { it.fileName ?: return false }.toList()
+                    val cleanedQuarantines = cleanupAbandonedAssetDeletionQuarantines(openedDirectory, childNames) ?: return false
+                    val children = childNames.filterNot { it in cleanedQuarantines }.map(Path::toString)
+                    if (children.count { it == OWNER_MARKER } != 1) return false
+                    val assets = children.filterNot { it == OWNER_MARKER }
+                    val assetFiles = assets.map { name ->
+                        if (!isSafeStagedAssetName(name)) return false
+                        val namePath = audioDirectory.toPath().fileSystem.getPath(name)
+                        val attributes = openedDirectory.getFileAttributeView(
+                            namePath,
+                            BasicFileAttributeView::class.java,
+                            LinkOption.NOFOLLOW_LINKS,
+                        )?.readAttributes() ?: return false
+                        if (!attributes.isRegularFile) return false
+                        namePath to (attributes.fileKey() ?: return false)
+                    }
+                    assetFiles.forEach { (namePath, expectedFileKey) ->
+                        if (!PrivateAudioPath.isSameDirectory(directory, openedDirectory) ||
+                            !PrivateAudioPath.deleteRegularFileNoFollow(openedDirectory, namePath, expectedFileKey)
+                        ) return false
+                    }
+                    if (assetFiles.isNotEmpty() && !syncDirectoryIfPresent(directory, openedDirectory)) return false
+                    if (!PrivateAudioPath.hasExpectedDirectChildContentsNoFollow(openedDirectory, markerName, id)) return false
+                    if (!PrivateAudioPath.isSameDirectory(directory, openedDirectory)) return false
+                    if (!PrivateAudioPath.isOpenedDirectoryKey(expectedDirectoryKey, openedDirectory)) return false
+                    openedDirectory.deleteFile(markerName)
+                    if (!syncDirectoryIfPresent(directory, openedDirectory)) return false
+                    if (!PrivateAudioPath.isSameDirectory(directory, openedDirectory) ||
+                        !PrivateAudioPath.isSameDirectory(audioDirectory, audioHandle) ||
+                        PrivateAudioPath.directoryFileKeyNoFollow(directory) != expectedDirectoryKey
+                    ) return false
+                    audioHandle.deleteDirectory(directoryName)
+                }
+                syncDirectoryIfPresent(audioDirectory, audioHandle)
+            }
+        } catch (_: Exception) {
+            false
         }
-        assets.forEach { if (!it.delete()) return false }
-        if (assets.isNotEmpty() && !syncDirectoryIfPresent(directory)) return false
+    }
 
-        val remaining = directory.listFiles()?.toList() ?: return false
-        if (remaining.size != 1 || remaining.single().name != OWNER_MARKER || !isOwnedMarker(directory, marker, id)) {
-            return false
+    private fun cleanupAbandonedAssetDeletionQuarantines(
+        directory: SecureDirectoryStream<Path>,
+        children: List<Path>,
+    ): Set<Path>? {
+        val cleanedQuarantines = mutableSetOf<Path>()
+        children.forEach { quarantineName ->
+            val targetName = PrivateAudioPath.deletionQuarantineTargetName(quarantineName) ?: return@forEach
+            if (!isSafeStagedAssetName(targetName.toString())) return null
+            val attributes = directory.getFileAttributeView(
+                quarantineName,
+                BasicFileAttributeView::class.java,
+                LinkOption.NOFOLLOW_LINKS,
+            )?.readAttributes() ?: return null
+            if (!attributes.isRegularFile ||
+                !PrivateAudioPath.cleanupDeleteQuarantineNoFollow(directory, targetName)
+            ) return null
+            cleanedQuarantines.add(quarantineName)
         }
-        if (!marker.delete()) return false
-        if (!PrivateAudioPath.isDirectChild(audioDirectory, directory) || !directory.delete()) return false
-        return syncDirectoryIfPresent(audioDirectory)
+        return cleanedQuarantines
     }
 
     private fun retryAbandonedRecoveryCleanup(forceSyncDirectories: Boolean): Boolean {
         val journalTemporariesCleaned = cleanupAbandonedJournalTemporaries(forceSyncDirectories)
         val stagingDirectoriesCleaned = cleanupAbandonedStagingDirectories(forceSyncDirectories)
-        return journalTemporariesCleaned && stagingDirectoriesCleaned
+        val generationDirectoriesCleaned = cleanupAbandonedRestoreGenerations(forceSyncDirectories)
+        return journalTemporariesCleaned && stagingDirectoriesCleaned && generationDirectoriesCleaned
     }
 
     private fun cleanupAbandonedStagingDirectories(forceSyncDirectory: Boolean): Boolean {
@@ -682,29 +932,119 @@ internal class LibraryRestoreTransaction(
         return cleanupComplete && parentSynced
     }
 
-    private fun cleanupAbandonedJournalTemporaries(forceSyncDirectory: Boolean): Boolean {
-        if (!filesDirectory.isDirectory || !PrivateAudioPath.isCanonicalDirectory(filesDirectory)) return false
-        val children = filesDirectory.listFiles() ?: return false
+    private fun cleanupAbandonedRestoreGenerations(forceSyncDirectory: Boolean): Boolean {
+        if (!audioDirectory.exists()) {
+            return !forceSyncDirectory || syncDirectoryIfPresent(audioDirectory)
+        }
+        if (!audioDirectory.isDirectory || !PrivateAudioPath.isCanonicalDirectory(audioDirectory)) return false
+        val children = try {
+            audioDirectory.listFiles()
+        } catch (_: Exception) {
+            null
+        } ?: return false
         var cleanupComplete = true
         var candidateFound = false
         children.forEach { child ->
-            val id = child.name.removePrefix(JOURNAL_TEMP_PREFIX)
-                .takeIf { child.name.startsWith(JOURNAL_TEMP_PREFIX) && isUuid(it) } ?: return@forEach
-            if (!PrivateAudioPath.isDirectChild(filesDirectory, child)) return@forEach
-            if (!Files.isRegularFile(child.toPath(), LinkOption.NOFOLLOW_LINKS)) return@forEach
-            if (!isUuid(id)) return@forEach
+            val id = PrivateAudioPath.restoreGenerationId(child.name) ?: return@forEach
+            if (!PrivateAudioPath.isDirectChild(audioDirectory, child)) return@forEach
+            val isRealDirectory = try {
+                !Files.isSymbolicLink(child.toPath()) && Files.isDirectory(child.toPath(), LinkOption.NOFOLLOW_LINKS)
+            } catch (_: Exception) {
+                null
+            }
+            if (isRealDirectory == null) {
+                candidateFound = true
+                cleanupComplete = false
+                return@forEach
+            }
+            if (!isRealDirectory) return@forEach
+
+            val contents = try {
+                child.listFiles()
+            } catch (_: Exception) {
+                null
+            }
+            if (contents == null) {
+                candidateFound = true
+                cleanupComplete = false
+                return@forEach
+            }
+            if (contents.isNotEmpty()) return@forEach
+
             candidateFound = true
-            if (!child.delete() && child.exists()) cleanupComplete = false
+            if (!deleteEmptyMarkerlessGenerationDirectory(child, id)) cleanupComplete = false
         }
         val mustSyncParent = forceSyncDirectory || candidateFound
-        val parentSynced = !mustSyncParent || syncDirectoryIfPresent(filesDirectory)
+        val parentSynced = !mustSyncParent || syncDirectoryIfPresent(audioDirectory)
         return cleanupComplete && parentSynced
     }
 
-    private fun syncDirectoryIfPresent(directory: File): Boolean {
+    private fun cleanupAbandonedJournalTemporaries(forceSyncDirectory: Boolean): Boolean {
+        if (!filesDirectory.isDirectory || !PrivateAudioPath.isCanonicalDirectory(filesDirectory)) return false
+        return try {
+            PrivateAudioPath.openDirectoryNoFollow(filesDirectory).use { filesHandle ->
+                if (!PrivateAudioPath.isSameDirectory(filesDirectory, filesHandle)) return false
+                // Probe the resolved path too; cleanup candidates below come only from the pinned handle.
+                filesDirectory.listFiles() ?: return false
+                val children = filesHandle.map { entry -> entry.fileName ?: return false }.toList()
+                var cleanupComplete = true
+                var candidateFound = false
+                children.forEach { child ->
+                    val targetName = PrivateAudioPath.deletionQuarantineTargetName(child) ?: child
+                    val id = targetName.toString().removePrefix(JOURNAL_TEMP_PREFIX)
+                        .takeIf { targetName.toString().startsWith(JOURNAL_TEMP_PREFIX) && isUuid(it) } ?: return@forEach
+                    candidateFound = true
+                    val attributes = try {
+                        filesHandle.getFileAttributeView(
+                            targetName,
+                            BasicFileAttributeView::class.java,
+                            LinkOption.NOFOLLOW_LINKS,
+                        )?.readAttributes()
+                    } catch (_: NoSuchFileException) {
+                        null
+                    }
+                    if (attributes == null) {
+                        if (PrivateAudioPath.hasDeleteQuarantineNoFollow(filesHandle, targetName) &&
+                            !PrivateAudioPath.deleteRegularFileNoFollow(filesHandle, targetName)
+                        ) cleanupComplete = false
+                        return@forEach
+                    }
+                    if (!attributes.isRegularFile) return@forEach
+                    if (!PrivateAudioPath.deleteRegularFileNoFollow(filesHandle, targetName)) cleanupComplete = false
+                }
+                val mustSyncParent = forceSyncDirectory || candidateFound
+                val parentSynced = !mustSyncParent || syncDirectoryIfPresent(filesDirectory, filesHandle)
+                cleanupComplete && parentSynced
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun hasEntryNoFollow(directory: SecureDirectoryStream<Path>, childName: Path): Boolean = try {
+        directory.getFileAttributeView(
+            childName,
+            BasicFileAttributeView::class.java,
+            LinkOption.NOFOLLOW_LINKS,
+        )?.readAttributes() != null
+    } catch (_: NoSuchFileException) {
+        false
+    }
+
+    private fun syncDirectoryIfPresent(
+        directory: File,
+        openedDirectory: SecureDirectoryStream<Path>? = null,
+    ): Boolean {
+        if (openedDirectory != null) {
+            return runCatching { durability.syncDirectory(directory, openedDirectory) }.isSuccess
+        }
         if (!directory.exists()) return true
         if (!directory.isDirectory || !PrivateAudioPath.isCanonicalDirectory(directory)) return false
-        return runCatching { durability.syncDirectory(directory) }.isSuccess
+        return runCatching {
+            PrivateAudioPath.openDirectoryNoFollow(directory).use { opened ->
+                durability.syncDirectory(directory, opened)
+            }
+        }.isSuccess
     }
 
     private fun isOwnedStagingDirectory(directory: File, id: String): Boolean =
@@ -712,12 +1052,8 @@ internal class LibraryRestoreTransaction(
             PrivateAudioPath.isDirectChild(audioDirectory, directory) && directory.isDirectory &&
             isOwnedMarker(directory, File(directory, OWNER_MARKER), id)
 
-    private fun isOwnedMarker(directory: File, marker: File, id: String): Boolean = try {
-        marker.length() in 1..64 && marker.isFile && PrivateAudioPath.isDirectChild(directory, marker) &&
-            marker.readText(Charsets.UTF_8) == id
-    } catch (_: Exception) {
-        false
-    }
+    private fun isOwnedMarker(directory: File, marker: File, id: String): Boolean =
+        PrivateAudioPath.hasExpectedDirectChildContentsNoFollow(directory, marker, id)
 
     private fun isSafeStagedAssetName(name: String): Boolean {
         if (name == OWNER_MARKER || '/' in name || '\\' in name) return false

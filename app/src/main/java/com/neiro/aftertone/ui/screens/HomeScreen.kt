@@ -55,6 +55,7 @@ fun HomeScreen(
     onToggleFavorite: (String) -> Unit,
     onAddToCollection: (String) -> Unit,
     onRemoveFromDevice: (Track) -> Unit,
+    onChooseArtwork: (String) -> Unit,
 ) {
     val recentTracks = library.tracks.asReversed().take(4)
     val spotlight = recentTracks.firstOrNull()
@@ -147,6 +148,7 @@ fun HomeScreen(
                         onToggleFavorite = { onToggleFavorite(track.id) },
                         onAddToCollection = { onAddToCollection(track.id) },
                         onRemoveFromDevice = { onRemoveFromDevice(track) },
+                        onChooseArtwork = onChooseArtwork,
                     )
                 }
             }

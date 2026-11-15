@@ -4,6 +4,8 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
 import java.nio.file.Files
+import java.nio.file.LinkOption
+import com.neiro.aftertone.model.PrivateAudioPath
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -126,6 +128,272 @@ class PreparedBackupArchiveFilesTest {
             val retried = PreparedBackupArchiveFiles.cleanupOrphansWithPending(cache)
             assertTrue(retried.pendingIds.isEmpty())
             assertFalse(File(cache, "aftertone-restore-source-$id.owner").exists())
+        } finally {
+            cache.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun orphanSweepRemovesSafelyNamedArchiveWithoutOwnerMarkerOnly() {
+        val cache = Files.createTempDirectory("aftertone-prepared-archive-orphan-zip-").toFile()
+        try {
+            val id = "55555555-5555-5555-5555-555555555555"
+            val orphan = File(cache, "${PreparedBackupArchiveFiles.ARCHIVE_PREFIX}$id.zip").apply {
+                writeBytes(byteArrayOf(1, 2, 3))
+            }
+            val malformedName = File(cache, "${PreparedBackupArchiveFiles.ARCHIVE_PREFIX}not-a-uuid.zip")
+                .apply { writeBytes(byteArrayOf(4, 5, 6)) }
+            val unexpected = File(cache, "keep-this.txt").apply { writeBytes(byteArrayOf(7, 8, 9)) }
+
+            val cleanup = PreparedBackupArchiveFiles.cleanupOrphansWithPending(cache)
+
+            assertEquals(1, cleanup.removedArchives)
+            assertTrue(cleanup.pendingIds.isEmpty())
+            assertFalse(orphan.exists())
+            assertTrue(malformedName.isFile)
+            assertTrue(unexpected.isFile)
+        } finally {
+            cache.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun orphanSweepRecoversOwnerMarkerMovedIntoDeleteQuarantine() {
+        val cache = Files.createTempDirectory("aftertone-owner-marker-quarantine-").toFile()
+        try {
+            val id = "66666666-6666-6666-6666-666666666666"
+            val marker = PreparedBackupArchiveFiles.ownerMarker(cache, id)
+            PreparedBackupArchiveFiles.create(cache, id)
+            val markerName = marker.toPath().fileName
+            val quarantineName = requireNotNull(PrivateAudioPath.deletionQuarantineName(markerName))
+            val abandoned = File(cache, quarantineName.toString())
+            Files.move(marker.toPath(), abandoned.toPath())
+
+            val cleanup = PreparedBackupArchiveFiles.cleanupOrphansWithPending(cache)
+
+            assertFalse("Orphan cleanup must recover the marker deletion left mid-flight.", abandoned.exists())
+            assertTrue(cleanup.pendingIds.isEmpty())
+        } finally {
+            cache.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun discardKeepsExternalMarkerWhenCachePathIsReplacedDuringSync() {
+        val root = Files.createTempDirectory("aftertone-prepared-archive-directory-race-").toFile()
+        try {
+            val cache = File(root, "cache").apply { assertTrue(mkdir()) }
+            val movedCache = File(root, "opened-cache")
+            val outside = File(root, "outside").apply { assertTrue(mkdir()) }
+            val id = "88888888-8888-8888-8888-888888888888"
+            val archive = PreparedBackupArchiveFiles.create(cache, id).apply { writeBytes(byteArrayOf(1, 2, 3)) }
+            val externalMarker = File(outside, "${PreparedBackupArchiveFiles.ARCHIVE_PREFIX}$id.owner").apply { writeText(id) }
+            var syncCalls = 0
+            val swapCacheDuringSync = object : RestoreFileDurability {
+                override fun syncFile(output: FileOutputStream) = output.fd.sync()
+
+                override fun syncDirectory(directory: File) {
+                    syncCalls++
+                    if (syncCalls == 1) {
+                        Files.move(cache.toPath(), movedCache.toPath())
+                        Files.createSymbolicLink(cache.toPath(), outside.toPath())
+                    }
+                }
+            }
+
+            assertFalse(
+                "Discard must not report durable cleanup when the cache pathname no longer resolves to the opened directory.",
+                PreparedBackupArchiveFiles.discard(cache, id, swapCacheDuringSync),
+            )
+
+            assertFalse("The archive should be removed from the opened cache directory.", File(movedCache, archive.name).exists())
+            assertTrue("A cache-path replacement must not redirect marker deletion outside the opened cache.", externalMarker.isFile)
+            assertEquals(id, externalMarker.readText(Charsets.UTF_8))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun archiveWriterAndFailureCleanupStayBoundToOpenedCacheAfterPathReplacement() {
+        val root = Files.createTempDirectory("aftertone-prepared-archive-writer-race-").toFile()
+        try {
+            val cache = File(root, "cache").apply { assertTrue(mkdir()) }
+            val movedCache = File(root, "opened-cache")
+            val outside = File(root, "outside").apply { assertTrue(mkdir()) }
+            val id = "99999999-9999-9999-9999-999999999999"
+            val archiveName = "${PreparedBackupArchiveFiles.ARCHIVE_PREFIX}$id.zip"
+            val externalArchive = File(outside, archiveName).apply { writeText("preserve this file") }
+            var validationReached = false
+            val durability = object : RestoreFileDurability {
+                override fun syncFile(output: FileOutputStream) = output.fd.sync()
+
+                override fun syncDirectory(directory: File) = Unit
+            }
+
+            assertThrows(IOException::class.java) {
+                PreparedBackupArchiveFiles.createAndWriteAndValidate(
+                    cacheDirectory = cache,
+                    id = id,
+                    durability = durability,
+                    writeArchive = { output ->
+                        Files.move(cache.toPath(), movedCache.toPath())
+                        Files.createSymbolicLink(cache.toPath(), outside.toPath())
+                        output.write(byteArrayOf(1, 2, 3, 4))
+                    },
+                    validateArchive = { archive ->
+                        validationReached = true
+                        archive.readBytes()
+                    },
+                )
+            }
+
+            assertFalse("The staged archive must be removed from the pinned cache after failure.", File(movedCache, archiveName).exists())
+            val markerName = "${PreparedBackupArchiveFiles.ARCHIVE_PREFIX}$id.owner"
+            assertFalse("The owner marker must be removed from the pinned cache after failure.", File(movedCache, markerName).exists())
+            assertTrue("A replacement cache must not be modified or have its archive truncated.", externalArchive.isFile)
+            assertEquals("preserve this file", externalArchive.readText(Charsets.UTF_8))
+            assertFalse("Archive validation must not run after the pinned path identity is lost.", validationReached)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun archiveValidationRejectsEntryReplacementDuringInspection() {
+        val root = Files.createTempDirectory("aftertone-prepared-archive-entry-race-").toFile()
+        try {
+            val cache = File(root, "cache").apply { assertTrue(mkdir()) }
+            val id = "88888888-8888-8888-8888-888888888888"
+            val outside = File(root, "outside.zip").apply { writeBytes(byteArrayOf(9, 8, 7)) }
+            var validationReadBytes: List<Int>? = null
+            val durability = object : RestoreFileDurability {
+                override fun syncFile(output: FileOutputStream) = output.fd.sync()
+
+                override fun syncDirectory(directory: File) = Unit
+            }
+
+            assertThrows(IOException::class.java) {
+                PreparedBackupArchiveFiles.createAndWriteAndValidate(
+                    cacheDirectory = cache,
+                    id = id,
+                    durability = durability,
+                    writeArchive = { output -> output.write(byteArrayOf(1, 2, 3, 4)) },
+                    validateArchive = { archive ->
+                        val stagedArchive = PreparedBackupArchiveFiles.archiveFile(cache, id)
+                        Files.createSymbolicLink(stagedArchive.toPath(), outside.toPath())
+                        validationReadBytes = archive.readBytes().map(Byte::toInt)
+                        validationReadBytes
+                    },
+                )
+            }
+
+            assertEquals("Inspection must read the private snapshot, not the replaced source path.", listOf(1, 2, 3, 4), validationReadBytes)
+            assertTrue("The outside target must remain unchanged.", outside.isFile)
+            assertEquals(listOf(9, 8, 7), outside.readBytes().map(Byte::toInt))
+            assertFalse(
+                "Failed validation must unlink the replaced symlink from the pinned cache without touching its target.",
+                Files.exists(PreparedBackupArchiveFiles.archiveFile(cache, id).toPath(), LinkOption.NOFOLLOW_LINKS),
+            )
+            assertFalse(PreparedBackupArchiveFiles.ownerMarker(cache, id).exists())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun orphanCleanupRemovesOwnedValidationSnapshot() {
+        val cache = Files.createTempDirectory("aftertone-validation-snapshot-orphan-").toFile()
+        try {
+            val id = "77777777-7777-7777-7777-777777777777"
+            PreparedBackupArchiveFiles.create(cache, id)
+            val snapshot = File(
+                cache,
+                "${PreparedBackupArchiveFiles.ARCHIVE_PREFIX}$id.validation-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.zip",
+            ).apply { writeBytes(byteArrayOf(1, 2, 3)) }
+
+            val cleanup = PreparedBackupArchiveFiles.cleanupOrphansWithPending(cache)
+
+            assertTrue("An owned abandoned validation snapshot should be discarded.", cleanup.pendingIds.isEmpty())
+            assertFalse(snapshot.exists())
+            assertFalse(PreparedBackupArchiveFiles.ownerMarker(cache, id).exists())
+        } finally {
+            cache.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun orphanCleanupKeepsUnownedValidationSnapshotPending() {
+        val cache = Files.createTempDirectory("aftertone-unowned-validation-snapshot-").toFile()
+        try {
+            val id = "55555555-5555-5555-5555-555555555555"
+            val snapshot = File(
+                cache,
+                "${PreparedBackupArchiveFiles.ARCHIVE_PREFIX}$id.validation-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.zip",
+            ).apply { writeBytes(byteArrayOf(4, 5, 6)) }
+
+            val cleanup = PreparedBackupArchiveFiles.cleanupOrphansWithPending(cache)
+
+            assertEquals(listOf(id), cleanup.pendingIds)
+            assertTrue(snapshot.isFile)
+        } finally {
+            cache.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun discardKeepsOwnerMarkerWhenArchiveRemovalSyncFails() {
+        val cache = Files.createTempDirectory("aftertone-prepared-archive-first-sync-failure-").toFile()
+        try {
+            val id = "66666666-6666-6666-6666-666666666666"
+            val archive = PreparedBackupArchiveFiles.create(cache, id).apply { writeBytes(byteArrayOf(1, 2, 3)) }
+            val marker = File(cache, "${PreparedBackupArchiveFiles.ARCHIVE_PREFIX}$id.owner")
+            var syncCalls = 0
+            val failFirstSync = object : RestoreFileDurability {
+                override fun syncFile(output: FileOutputStream) = output.fd.sync()
+
+                override fun syncDirectory(directory: File) {
+                    assertEquals(cache, directory)
+                    syncCalls++
+                    if (syncCalls == 1) throw IOException("Injected archive-removal sync failure.")
+                    SystemRestoreFileDurability.syncDirectory(directory)
+                }
+            }
+
+            assertFalse(PreparedBackupArchiveFiles.discard(cache, id, failFirstSync))
+            assertFalse(archive.exists())
+            assertTrue(marker.isFile)
+            assertTrue(PreparedBackupArchiveFiles.discard(cache, id))
+            assertFalse(marker.exists())
+        } finally {
+            cache.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun discardCanRetryDirectorySyncAfterOwnerMarkerRemovalSyncFails() {
+        val cache = Files.createTempDirectory("aftertone-prepared-archive-second-sync-failure-").toFile()
+        try {
+            val id = "77777777-7777-7777-7777-777777777777"
+            val archive = PreparedBackupArchiveFiles.create(cache, id).apply { writeBytes(byteArrayOf(1, 2, 3)) }
+            val marker = File(cache, "${PreparedBackupArchiveFiles.ARCHIVE_PREFIX}$id.owner")
+            var syncCalls = 0
+            val failSecondSync = object : RestoreFileDurability {
+                override fun syncFile(output: FileOutputStream) = output.fd.sync()
+
+                override fun syncDirectory(directory: File) {
+                    assertEquals(cache, directory)
+                    syncCalls++
+                    if (syncCalls == 2) throw IOException("Injected owner-marker removal sync failure.")
+                    SystemRestoreFileDurability.syncDirectory(directory)
+                }
+            }
+
+            assertFalse(PreparedBackupArchiveFiles.discard(cache, id, failSecondSync))
+            assertEquals(2, syncCalls)
+            assertFalse(archive.exists())
+            assertFalse(marker.exists())
+            assertTrue(PreparedBackupArchiveFiles.discard(cache, id))
         } finally {
             cache.deleteRecursively()
         }

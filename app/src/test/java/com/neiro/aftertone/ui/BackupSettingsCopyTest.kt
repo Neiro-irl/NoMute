@@ -13,7 +13,7 @@ class BackupSettingsCopyTest {
         val copy = backupRestoreConfirmationCopy(BackupSummary(10, 2, 3, 1_258_291))
 
         assertEquals("10 треков · 2 подборки · 3 трека в избранном", copy.itemCounts)
-        assertEquals("Аудиофайлы и обложки: 1,2 МБ", copy.payloadDescription)
+        assertEquals("Музыка и обложки: 1,2 МБ · целостность проверяется при восстановлении", copy.payloadDescription)
         assertTrue(copy.replacementWarning.contains("будет заменена"))
         assertTrue(copy.replacementWarning.contains("только после сохранения"))
         assertTrue(copy.replacementWarning.lowercase().contains("текущий трек остановится"))

@@ -27,12 +27,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.neiro.aftertone.R
 import com.neiro.aftertone.model.Track
 import com.neiro.aftertone.ui.theme.AftertoneAccent
 import com.neiro.aftertone.ui.theme.AftertoneMuted
@@ -45,6 +47,7 @@ fun TrackRow(
     onToggleFavorite: () -> Unit,
     onAddToCollection: () -> Unit,
     onRemoveFromDevice: () -> Unit,
+    onChooseArtwork: (String) -> Unit,
     onRemoveFromCollection: (() -> Unit)? = null,
 ) {
     var menuExpanded by remember(track.id) { mutableStateOf(false) }
@@ -98,6 +101,10 @@ fun TrackRow(
                 Icon(Icons.Filled.MoreVert, contentDescription = null, tint = AftertoneMuted)
             }
             DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
+                DropdownMenuItem(
+                    text = { Text(stringResource(if (track.artworkPath == null) R.string.choose_track_artwork else R.string.change_track_artwork)) },
+                    onClick = { menuExpanded = false; onChooseArtwork(track.id) },
+                )
                 DropdownMenuItem(
                     text = { Text("Добавить в подборку") },
                     onClick = { menuExpanded = false; onAddToCollection() },

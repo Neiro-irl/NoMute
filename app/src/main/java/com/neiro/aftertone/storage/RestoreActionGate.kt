@@ -15,6 +15,7 @@ internal class RestoreActionGate {
     private var blocked = true
     private var activeRestore: RestoreOperation? = null
     private var pendingCleanupId: String? = null
+    private val activeDispatchPermits = mutableSetOf<DispatchPermit>()
     private val mutationMutex = Mutex()
 
     val isBlocked: Boolean
@@ -37,6 +38,11 @@ internal class RestoreActionGate {
         check(!blocked && activeRestore == null) { "A restore or its cleanup is already pending." }
         blocked = true
         RestoreOperation(this).also { activeRestore = it }
+    }
+
+    fun tryAcquireExternalAudioDispatchPermit(): DispatchPermit? = synchronized(stateLock) {
+        if (blocked || activeRestore != null) return@synchronized null
+        DispatchPermit(this).also { activeDispatchPermits.add(it) }
     }
 
     fun beginCleanupRetry(): RestoreOperation? = synchronized(stateLock) {
@@ -90,6 +96,12 @@ internal class RestoreActionGate {
         true
     }
 
+    fun runIfAllowed(permit: DispatchPermit, action: () -> Unit): Boolean = synchronized(stateLock) {
+        if (permit !in activeDispatchPermits) return@synchronized false
+        action()
+        true
+    }
+
     fun allowsMediaSessionCommand(isTrusted: Boolean, isAppController: Boolean): Boolean =
         isTrusted && (isAppController || !isBlocked)
 
@@ -99,6 +111,10 @@ internal class RestoreActionGate {
 
     suspend fun <T> withRestoreLock(action: suspend () -> T): T = mutationMutex.withLock {
         action()
+    }
+
+    private fun release(permit: DispatchPermit) {
+        synchronized(stateLock) { activeDispatchPermits.remove(permit) }
     }
 
     private fun markCommitted(operation: RestoreOperation, transactionId: String) {
@@ -148,6 +164,10 @@ internal class RestoreActionGate {
         fun markCommitted(transactionId: String) = gate.markCommitted(this, transactionId)
         fun markCleanupComplete() = gate.markCleanupComplete(this)
         fun finish() = gate.finish(this)
+    }
+
+    class DispatchPermit internal constructor(private val gate: RestoreActionGate) : AutoCloseable {
+        override fun close() = gate.release(this)
     }
 }
 

@@ -19,6 +19,22 @@ private val audioExtensionsByMime = mapOf(
     "audio/3gpp" to "3gp",
 )
 
+private data class AudioTrackFormatPolicy(
+    val fallbackExtension: String,
+    val supportedContainerExtensions: Set<String>,
+)
+
+private val audioTrackFormatPolicies = mapOf(
+    "audio/mp4a-latm" to AudioTrackFormatPolicy(
+        fallbackExtension = "aac",
+        supportedContainerExtensions = setOf("aac", "m4a", "3gp"),
+    ),
+    "audio/raw" to AudioTrackFormatPolicy(
+        fallbackExtension = "wav",
+        supportedContainerExtensions = setOf("wav"),
+    ),
+)
+
 private val safeFileId = Regex("[A-Za-z0-9_-]{1,80}")
 
 data class Track(
@@ -29,6 +45,10 @@ data class Track(
     val durationMs: Long = 0,
     val filePath: String,
     val artworkPath: String? = null,
+    val externalImportRequestId: String? = null,
+    val externalImportHandoffClaimed: Boolean = false,
+    val externalImportHandoffDispatchStarted: Boolean? = null,
+    val externalImportHandoffCompleted: Boolean = false,
 ) {
     val displayTitle: String
         get() = title.trim().ifEmpty { "Без названия" }
@@ -95,6 +115,35 @@ data class LibrarySnapshot(
     )
 }
 
+object TrackArtworkFileName {
+    private val coverIdPattern = Regex("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+    fun forCustomCover(id: String, coverId: String = java.util.UUID.randomUUID().toString()): String {
+        require(safeFileId.matches(id)) { "The track ID is not a safe file name." }
+        require(isCanonicalCoverId(coverId)) { "The cover ID is not a canonical UUID." }
+        return "$id-cover-$coverId.img"
+    }
+
+    fun isGeneratedCoverFileName(fileName: String): Boolean {
+        if (!fileName.endsWith(".img")) return false
+        val baseName = fileName.removeSuffix(".img")
+        val marker = baseName.lastIndexOf("-cover-")
+        if (marker <= 0) return false
+        val id = baseName.substring(0, marker)
+        val coverId = baseName.substring(marker + "-cover-".length)
+        return safeFileId.matches(id) && isCanonicalCoverId(coverId)
+    }
+
+    fun isGeneratedFileName(id: String, fileName: String): Boolean {
+        if (!safeFileId.matches(id)) return false
+        return fileName == "$id.img" ||
+            (fileName.startsWith("$id-cover-") && isGeneratedCoverFileName(fileName))
+    }
+
+    private fun isCanonicalCoverId(value: String): Boolean = coverIdPattern.matches(value) &&
+        runCatching { java.util.UUID.fromString(value).toString() == value }.getOrDefault(false)
+}
+
 object TrackFileName {
     fun forImport(id: String, displayName: String, mimeType: String?): String? {
         if (!safeFileId.matches(id)) return null
@@ -105,14 +154,39 @@ object TrackFileName {
             "application/octet-stream",
             "binary/octet-stream",
         )
-        if (!isAudioMime && !isGenericMime) return null
-
         val nameOnly = displayName.substringAfterLast('/').substringAfterLast('\\')
         val extensionFromName = nameOnly.substringAfterLast('.', missingDelimiterValue = "").lowercase()
-        val extension = audioExtensionsByMime[normalizedMime]
-            ?: extensionFromName.takeIf { it in audioExtensions }
-            ?: return null
+        val supportedExtensionFromName = extensionFromName.takeIf { it in audioExtensions }
+        if (isAudioMime) {
+            val mappedExtension = audioExtensionsByMime[normalizedMime]
+                ?: audioTrackFormatPolicies[normalizedMime]?.fallbackExtension
+                ?: return null
+            return "$id.$mappedExtension"
+        }
+        if (!isGenericMime && supportedExtensionFromName == null) return null
+        val extension = audioExtensionsByMime[normalizedMime] ?: supportedExtensionFromName ?: return null
 
+        return "$id.$extension"
+    }
+
+    fun forDetectedAudioTrack(
+        id: String,
+        displayName: String,
+        detectedAudioMimeType: String,
+        containerMimeType: String?,
+    ): String? {
+        if (!safeFileId.matches(id)) return null
+        val normalizedDetectedMime = detectedAudioMimeType.substringBefore(';').trim().lowercase()
+        val policy = audioTrackFormatPolicies[normalizedDetectedMime]
+            ?: return forImport(id, displayName, detectedAudioMimeType)
+
+        val containerExtensionFromMime = containerMimeType
+            ?.substringBefore(';')
+            ?.trim()
+            ?.lowercase()
+            ?.let(audioExtensionsByMime::get)
+            ?.takeIf { it in policy.supportedContainerExtensions }
+        val extension = containerExtensionFromMime ?: policy.fallbackExtension
         return "$id.$extension"
     }
 

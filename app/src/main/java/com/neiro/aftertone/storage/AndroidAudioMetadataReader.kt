@@ -35,9 +35,13 @@ class AndroidAudioMetadataReader : AudioMetadataReader {
                 album = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ALBUM),
                 durationMs = extractedDuration ?: formatDuration ?: 0L,
                 artwork = validatedArtwork(retriever.embeddedPicture),
+                audioMimeType = audioFormat.getString(MediaFormat.KEY_MIME),
             )
         } catch (_: RuntimeException) {
-            return AudioMetadata(durationMs = runCatching { audioFormat.getLong(MediaFormat.KEY_DURATION) / 1_000L }.getOrDefault(0L))
+            return AudioMetadata(
+                durationMs = runCatching { audioFormat.getLong(MediaFormat.KEY_DURATION) / 1_000L }.getOrDefault(0L),
+                audioMimeType = audioFormat.getString(MediaFormat.KEY_MIME),
+            )
         } finally {
             retriever.release()
         }

@@ -23,16 +23,19 @@ import androidx.compose.material3.RadioButton
 import androidx.compose.material3.RadioButtonDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import com.neiro.aftertone.storage.BackupSummary
+import com.neiro.aftertone.R
 import com.neiro.aftertone.ui.theme.AftertoneAccent
 import com.neiro.aftertone.ui.theme.AftertoneMuted
 import com.neiro.aftertone.ui.theme.AftertoneOutline
@@ -45,6 +48,7 @@ internal fun SettingsScreen(
     onPaletteSelected: (AftertonePalette) -> Unit,
     installedVersion: String,
     onCheckForUpdates: () -> Unit,
+    onOpenLicense: () -> Unit,
     isBackupBusy: Boolean,
     isBackupCancelable: Boolean,
     backupProgressText: String?,
@@ -131,6 +135,23 @@ internal fun SettingsScreen(
                 installedVersion = installedVersion,
                 onCheckForUpdates = onCheckForUpdates,
             )
+        }
+        item {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    text = stringResource(R.string.license_section_title),
+                    color = AftertoneMuted,
+                    style = MaterialTheme.typography.labelMedium,
+                )
+                Text(
+                    text = stringResource(R.string.license_section_description),
+                    color = AftertoneMuted,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                TextButton(onClick = onOpenLicense) {
+                    Text(stringResource(R.string.license_action))
+                }
+            }
         }
     }
 }

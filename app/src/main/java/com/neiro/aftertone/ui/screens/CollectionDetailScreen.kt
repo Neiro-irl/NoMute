@@ -50,6 +50,7 @@ fun CollectionDetailScreen(
     onToggleFavorite: (String) -> Unit,
     onAddToCollection: (String) -> Unit,
     onRemoveFromDevice: (Track) -> Unit,
+    onChooseArtwork: (String) -> Unit,
     onRemoveFromPlaylist: (String, String) -> Unit,
 ) {
     val tracks = if (favorites) {
@@ -112,6 +113,7 @@ fun CollectionDetailScreen(
                         onToggleFavorite = { onToggleFavorite(track.id) },
                         onAddToCollection = { onAddToCollection(track.id) },
                         onRemoveFromDevice = { onRemoveFromDevice(track) },
+                        onChooseArtwork = onChooseArtwork,
                         onRemoveFromCollection = playlist?.id?.let { playlistId ->
                             { onRemoveFromPlaylist(playlistId, track.id) }
                         },

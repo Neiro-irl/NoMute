@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
@@ -29,11 +30,13 @@ import androidx.compose.material3.Snackbar
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -43,6 +46,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.core.net.toUri
 import androidx.media3.common.C
@@ -71,6 +75,7 @@ import com.neiro.aftertone.ui.screens.CollectionDetailScreen
 import com.neiro.aftertone.ui.screens.CollectionsScreen
 import com.neiro.aftertone.ui.screens.HomeScreen
 import com.neiro.aftertone.ui.screens.LibraryScreen
+import com.neiro.aftertone.ui.screens.LicenseNoticeDialog
 import com.neiro.aftertone.ui.screens.NowPlayingScreen
 import com.neiro.aftertone.ui.screens.SearchScreen
 import com.neiro.aftertone.ui.screens.SettingsScreen
@@ -94,6 +99,17 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 
+internal const val EXTERNAL_AUDIO_SUCCESS_NOTIFICATION_MESSAGE = "Трек добавлен в медиатеку и воспроизводится."
+
+internal fun enqueueExternalAudioSuccessNotification(
+    message: String?,
+    enqueue: (String) -> Unit,
+): String {
+    val stableMessage = message ?: EXTERNAL_AUDIO_SUCCESS_NOTIFICATION_MESSAGE
+    enqueue(stableMessage)
+    return stableMessage
+}
+
 internal enum class AppTab(val label: String) {
     HOME("Главная"),
     SEARCH("Поиск"),
@@ -104,28 +120,43 @@ internal enum class AppTab(val label: String) {
 
 private enum class Page { TAB, COLLECTION, NOW_PLAYING }
 private data class Destination(val page: Page, val tab: AppTab, val collectionId: String? = null)
+private enum class ArtworkUpdateResult { SAVED, FAILED, UNAVAILABLE }
 private const val FAVORITES_COLLECTION_ID = "__aftertone_favorites__"
 
 @Composable
 internal fun AftertoneApp(
     selectedPalette: AftertonePalette,
     onPaletteSelected: (AftertonePalette) -> Unit,
+    externalAudioRequest: ExternalAudioOpenRequest? = null,
+    onExternalAudioRequestHandled: (String, Int) -> Unit = { _, _ -> },
+    onExternalAudioRequestFailed: (String, Int, ExternalAudioOpenFailureKind, String) -> Unit = { _, _, _, _ -> },
+    onExternalAudioRequestFailureChoice: (String, Int, ExternalAudioOpenFailureChoice) -> Unit = { _, _, _ -> },
 ) {
     val context = LocalContext.current
+    val artworkSavedMessage = stringResource(R.string.track_artwork_saved)
+    val artworkSaveFailedMessage = stringResource(R.string.track_artwork_save_failed)
+    val libraryActionUnavailableMessage = stringResource(R.string.library_action_unavailable)
     val repository = remember(context.applicationContext) { LocalLibraryRepository.shared(context) }
     val restoreActionGate = repository.restoreActionGate
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
+    LaunchedEffect(Unit) {
+        ExternalAudioOpenNotifications.deliverContinuously { message -> snackbarHostState.showSnackbar(message) }
+    }
     val controller = rememberMediaController(context)
     val playback = rememberPlaybackUiState(controller)
 
     var library by remember { mutableStateOf(LibrarySnapshot()) }
     var isLibraryLoaded by remember { mutableStateOf(false) }
     var libraryLoadError by remember { mutableStateOf(false) }
+    var libraryLoadAttempt by remember { mutableIntStateOf(0) }
     var isImporting by remember { mutableStateOf(false) }
+    var isSavingArtwork by remember { mutableStateOf(false) }
+    var pendingArtworkTrackId by rememberSaveable { mutableStateOf<String?>(null) }
     var activeTab by rememberSaveable { mutableStateOf(AppTab.HOME) }
     var openCollectionId by rememberSaveable { mutableStateOf<String?>(null) }
     var showNowPlaying by rememberSaveable { mutableStateOf(false) }
+    var showLicenseDialog by rememberSaveable { mutableStateOf(false) }
     var showCreatePlaylist by remember { mutableStateOf(false) }
     var showPlaylistPicker by remember { mutableStateOf(false) }
     var trackToAddToPlaylist by remember { mutableStateOf<String?>(null) }
@@ -158,7 +189,9 @@ internal fun AftertoneApp(
         }
     }
 
-    LaunchedEffect(repository) {
+    LaunchedEffect(repository, libraryLoadAttempt) {
+        isLibraryLoaded = false
+        libraryLoadError = false
         try {
             library = withContext(Dispatchers.IO) { repository.load() }
         } catch (error: CancellationException) {
@@ -188,15 +221,17 @@ internal fun AftertoneApp(
             val counts = restoreActionGate.withLibraryAction {
                 isImporting = true
                 try {
-                    var importedCount = 0
+                    val importedTrackIds = linkedSetOf<String>()
                     var failedCount = 0
                     uris.forEach { uri ->
                         if (restoreActionGate.isBlocked) return@forEach
                         val result = runCatching { withContext(Dispatchers.IO) { repository.import(uri) } }
-                        if (result.isSuccess) importedCount++ else failedCount++
+                        result.onSuccess { importedTrackIds += it.id }.onFailure { failedCount++ }
                     }
                     library = withContext(Dispatchers.IO) { repository.load() }
-                    importedCount to failedCount
+                    val reloadedTrackIds = library.tracks.mapTo(hashSetOf()) { it.id }
+                    val counts = reconcileImportedTrackIds(importedTrackIds, failedCount, reloadedTrackIds)
+                    counts.importedCount to counts.failedCount
                 } finally {
                     isImporting = false
                 }
@@ -210,6 +245,55 @@ internal fun AftertoneApp(
             }
             snackbarHostState.showSnackbar(message)
         }
+    }
+
+    val artworkPickerLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        val trackId = pendingArtworkTrackId
+        pendingArtworkTrackId = null
+        if (uri != null && trackId != null) scope.launch {
+            val result = restoreActionGate.withLibraryAction {
+                if (!isLibraryLoaded || libraryLoadError || isImporting || isSavingArtwork || isBackupBusy ||
+                    pendingRestoreCleanupId != null || restoreActionGate.isBlocked
+                ) {
+                    ArtworkUpdateResult.UNAVAILABLE
+                } else {
+                    isSavingArtwork = true
+                    try {
+                        val updatedLibrary = withContext(Dispatchers.IO) {
+                            val input = context.contentResolver.openInputStream(uri)
+                                ?: throw IOException("Could not open the selected image.")
+                            input.use { repository.setTrackArtwork(trackId, it) }
+                        }
+                        library = updatedLibrary
+                        ArtworkUpdateResult.SAVED
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (_: Exception) {
+                        ArtworkUpdateResult.FAILED
+                    } finally {
+                        isSavingArtwork = false
+                    }
+                }
+            }
+            val message = when (result) {
+                ArtworkUpdateResult.SAVED -> artworkSavedMessage
+                ArtworkUpdateResult.FAILED -> artworkSaveFailedMessage
+                ArtworkUpdateResult.UNAVAILABLE, null -> libraryActionUnavailableMessage
+            }
+            snackbarHostState.showSnackbar(message)
+        }
+    }
+
+    fun launchChooseArtwork(trackId: String) {
+        if (pendingArtworkTrackId != null) return
+        if (!isLibraryLoaded || libraryLoadError || isImporting || isSavingArtwork || isBackupBusy ||
+            pendingRestoreCleanupId != null || restoreActionGate.isBlocked || library.tracks.none { it.id == trackId }
+        ) {
+            scope.launch { snackbarHostState.showSnackbar(libraryActionUnavailableMessage) }
+            return
+        }
+        pendingArtworkTrackId = trackId
+        artworkPickerLauncher.launch("image/*")
     }
 
     fun launchImport() {
@@ -289,17 +373,17 @@ internal fun AftertoneApp(
     fun inspectRestoreArchive(uri: Uri) {
         if (isBackupBusy) return
         val token = beginBackupOperation()
-        backupProgressText = "Проверяю выбранный ZIP…"
+        backupProgressText = "Читаю структуру выбранного ZIP…"
         scope.launch {
             var preparedForCleanup: PreparedBackupArchive? = null
-            var notification = "Архив проверен. Подтверди замену медиатеки."
+            var notification = "Структура архива и список файлов прочитаны. Целостность музыки и обложек проверится при восстановлении; подтверди замену медиатеки."
             try {
                 val prepared = withContext(Dispatchers.IO) {
                     val input = context.contentResolver.openInputStream(uri)
                         ?: throw IOException("Could not open the selected archive.")
                     repository.prepareBackupArchive(
                         input = input,
-                        onProgress = { reportBackupProgress(token, "Проверка ZIP", it) },
+                        onProgress = { reportBackupProgress(token, "Чтение структуры ZIP", it) },
                         checkCancelled = { checkBackupCancellation(token) },
                     )
                 }
@@ -603,12 +687,17 @@ internal fun AftertoneApp(
         }
     }
 
-    fun playTracks(tracks: List<Track>, selectedTrackId: String) {
-        restoreActionGate.runIfAllowed {
+    fun playTracks(
+        tracks: List<Track>,
+        selectedTrackId: String,
+        dispatchPermit: RestoreActionGate.DispatchPermit? = null,
+    ): Boolean {
+        var startedPlayback = false
+        fun enqueuePlayback() {
             val player = controller
             if (player == null || tracks.isEmpty()) {
                 scope.launch { snackbarHostState.showSnackbar("Проигрыватель подключается. Попробуй ещё раз через секунду.") }
-                return@runIfAllowed
+                return
             }
             val items = tracks.map { track ->
                 val metadata = MediaMetadata.Builder()
@@ -628,6 +717,224 @@ internal fun AftertoneApp(
             player.prepare()
             player.play()
             showNowPlaying = true
+            startedPlayback = true
+        }
+        val actionAllowed = if (dispatchPermit == null) {
+            restoreActionGate.runIfAllowed(::enqueuePlayback)
+        } else {
+            restoreActionGate.runIfAllowed(dispatchPermit, ::enqueuePlayback)
+        }
+        return actionAllowed && startedPlayback
+    }
+
+    LaunchedEffect(
+        externalAudioRequest?.id,
+        externalAudioRequest?.attempt,
+        externalAudioRequest?.failureKind,
+        externalAudioRequest?.failureMessage,
+        isLibraryLoaded,
+        libraryLoadError,
+        controller,
+        isBackupBusy,
+        pendingRestoreCleanupId,
+    ) {
+        val request = externalAudioRequest ?: return@LaunchedEffect
+        var requestAcknowledged = false
+        fun acknowledgeRequest() {
+            if (!requestAcknowledged) {
+                requestAcknowledged = true
+                onExternalAudioRequestHandled(request.id, request.attempt)
+            }
+        }
+
+        if (!isLibraryLoaded) return@LaunchedEffect
+        if (request.failureKind != null) {
+            if (request.failureKind == ExternalAudioOpenFailureKind.RestoreGate &&
+                !isBackupBusy && pendingRestoreCleanupId == null && !restoreActionGate.isBlocked
+            ) {
+                onExternalAudioRequestFailureChoice(
+                    request.id,
+                    request.attempt,
+                    ExternalAudioOpenFailureChoice.Retry,
+                )
+                return@LaunchedEffect
+            }
+            return@LaunchedEffect
+        }
+        if (libraryLoadError) {
+            onExternalAudioRequestFailed(
+                request.id,
+                request.attempt,
+                ExternalAudioOpenFailureKind.LibraryLoad,
+                "Не удалось открыть медиатеку. Можно повторить загрузку или пропустить этот файл.",
+            )
+            return@LaunchedEffect
+        }
+        if (controller == null) return@LaunchedEffect
+
+        var successNotificationMessage: String? = null
+        var preparedLibrary: LibrarySnapshot? = null
+        var failureMessage: String? = null
+        var failureKind = ExternalAudioOpenFailureKind.Import
+        val importedTrack = try {
+            completeExternalAudioOpenWhenAllowed(
+                requestId = request.id,
+                withLibraryAction = { action ->
+                    restoreActionGate.withLibraryAction {
+                        isImporting = true
+                        try {
+                            action()
+                        } finally {
+                            isImporting = false
+                        }
+                    }
+                },
+                dispatchPermitProvider = restoreActionGate::tryAcquireExternalAudioDispatchPermit,
+                onHandled = { acknowledgeRequest() },
+                importAndPersist = {
+                    withContext(Dispatchers.IO) { repository.importExternal(request.uri, request.id) }
+                },
+                reconcilePersistedImport = {
+                    val updatedLibrary = withContext(Dispatchers.IO) { repository.load() }
+                    preparedLibrary = updatedLibrary
+                    library = updatedLibrary
+                    updatedLibrary.tracks.firstOrNull { it.externalImportRequestId == request.id }
+                },
+                hasDurableDispatchOutcome = { requestId ->
+                    withContext(Dispatchers.IO) { repository.externalImportDispatchMayHaveStarted(requestId) }
+                },
+                prepareHandoff = { track ->
+                    val updatedLibrary = preparedLibrary ?: withContext(Dispatchers.IO) { repository.load() }
+                    if (updatedLibrary.tracks.none { it.id == track.id }) {
+                        throw ExternalAudioImportedTrackMissingException()
+                    }
+                    preparedLibrary = updatedLibrary
+                    library = updatedLibrary
+                },
+                markHandoffClaimedWithPermit = { track, dispatchPermit ->
+                    val claimedTrack = withContext(Dispatchers.IO) {
+                        repository.markExternalImportHandoffClaimed(request.id, dispatchPermit)
+                    }
+                    if (claimedTrack.id != track.id) {
+                        throw IOException("The external handoff claim was saved for a different track.")
+                    }
+                    failureMessage = null
+                    preparedLibrary = preparedLibrary?.let { snapshot ->
+                        snapshot.copy(
+                            tracks = snapshot.tracks.map { currentTrack ->
+                                if (currentTrack.id == claimedTrack.id) claimedTrack else currentTrack
+                            },
+                        )
+                    }
+                    claimedTrack
+                },
+                markHandoffDispatchStartedWithPermit = { track, dispatchPermit ->
+                    val dispatchTrack = withContext(Dispatchers.IO) {
+                        repository.markExternalImportHandoffDispatchStarted(request.id, dispatchPermit)
+                    }
+                    if (dispatchTrack.id != track.id) {
+                        throw IOException("The playback dispatch marker was saved for a different track.")
+                    }
+                    dispatchTrack
+                },
+                markHandoffNotDispatchedWithPermit = { track, dispatchPermit ->
+                    val resetTrack = withContext(Dispatchers.IO) {
+                        repository.markExternalImportHandoffNotDispatched(request.id, dispatchPermit)
+                    }
+                    if (resetTrack.id != track.id) {
+                        throw IOException("The no-dispatch marker was saved for a different track.")
+                    }
+                    val baseLibrary = preparedLibrary
+                        ?: throw IOException("The imported track was not prepared for playback.")
+                    val resetLibrary = baseLibrary.copy(
+                        tracks = baseLibrary.tracks.map { currentTrack ->
+                            if (currentTrack.id == resetTrack.id) resetTrack else currentTrack
+                        },
+                    )
+                    preparedLibrary = resetLibrary
+                    library = resetLibrary
+                    resetTrack
+                },
+                dispatchPlaybackWithPermit = { track, dispatchPermit, markDispatchStarted ->
+                    var dispatchLibrary: LibrarySnapshot? = null
+                    val outcome = dispatchExternalAudioPlayback(
+                        markDispatchStarted = {
+                            val startedTrack = markDispatchStarted()
+                            val baseLibrary = preparedLibrary
+                                ?: throw IOException("The imported track was not prepared for playback.")
+                            val startedLibrary = baseLibrary.copy(
+                                tracks = baseLibrary.tracks.map { currentTrack ->
+                                    if (currentTrack.id == startedTrack.id) startedTrack else currentTrack
+                                },
+                            )
+                            preparedLibrary = startedLibrary
+                            dispatchLibrary = startedLibrary
+                            library = startedLibrary
+                        },
+                        dispatchToPlayer = {
+                            val updatedLibrary = dispatchLibrary
+                                ?: throw IOException("Playback dispatch began without a prepared library.")
+                            playTracks(updatedLibrary.tracks, track.id, dispatchPermit)
+                        },
+                    )
+                    if (outcome == ExternalAudioHandoffDispatchOutcome.Dispatched) {
+                        successNotificationMessage = EXTERNAL_AUDIO_SUCCESS_NOTIFICATION_MESSAGE
+                    }
+                    outcome
+                },
+                markHandoffCompletedWithPermit = { track, dispatchPermit ->
+                    val completedTrack = withContext(Dispatchers.IO) {
+                        repository.markExternalImportHandoffCompleted(request.id, dispatchPermit)
+                    }
+                    if (completedTrack.id != track.id) {
+                        throw IOException("The external handoff was marked complete for a different track.")
+                    }
+                    library = library.copy(
+                        tracks = library.tracks.map { currentTrack ->
+                            if (currentTrack.id == completedTrack.id) completedTrack else currentTrack
+                        },
+                    )
+                    completedTrack
+                },
+                onHandoffCompleted = {
+                    // A same-Track Retry enters a new LaunchedEffect with no player-set message.
+                    successNotificationMessage = enqueueExternalAudioSuccessNotification(
+                        successNotificationMessage,
+                    ) { message -> ExternalAudioOpenNotifications.enqueue(request.id, message) }
+                },
+                onFailure = { error ->
+                    val restoreRetry = error is ExternalAudioDispatchAdmissionRejectedException ||
+                        error is ExternalAudioImportedTrackMissingException
+                    failureKind = if (restoreRetry) {
+                        ExternalAudioOpenFailureKind.RestoreGate
+                    } else {
+                        ExternalAudioOpenFailureKind.Import
+                    }
+                    failureMessage = when (error) {
+                        is ExternalAudioDispatchAdmissionRejectedException -> "Медиатека занята восстановлением. Запрос сохранён и повторится после его завершения."
+                        is ExternalAudioImportedTrackMissingException -> "Восстановление заменило импорт до запуска. Файл будет повторно импортирован после восстановления."
+                        is ExternalAudioPlaybackNotStartedException -> "Проигрыватель не запустился. Трек сохранён; можно повторить попытку или пропустить этот файл."
+                        is SecurityException -> "Нет доступа к выбранному файлу. Выбери его через системный аудиопикер и попробуй снова."
+                        is IllegalArgumentException -> "Файл не распознан как поддерживаемый аудиотрек или повреждён."
+                        is IOException -> "Не удалось обработать аудиофайл. Проверь, что файл доступен, и попробуй снова."
+                        else -> "Не удалось импортировать аудиофайл. Выбери поддерживаемый файл и попробуй снова."
+                    }
+                },
+            )
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            null
+        }
+        if (importedTrack == null) {
+            if (failureMessage == null && (restoreActionGate.isBlocked || isBackupBusy || pendingRestoreCleanupId != null)) {
+                failureKind = ExternalAudioOpenFailureKind.RestoreGate
+                failureMessage = "Медиатека занята восстановлением. Запрос сохранён и продолжится после восстановления."
+            } else if (failureMessage == null) {
+                failureKind = ExternalAudioOpenFailureKind.Import
+                failureMessage = "Не удалось импортировать аудиофайл. Можно повторить попытку или пропустить этот файл."
+            }
+            onExternalAudioRequestFailed(request.id, request.attempt, failureKind, requireNotNull(failureMessage))
         }
     }
 
@@ -796,6 +1103,7 @@ internal fun AftertoneApp(
                             onToggleFavorite = ::toggleFavorite,
                             onAddToCollection = ::addToCollection,
                             onRemoveFromDevice = ::requestRemove,
+                            onChooseArtwork = ::launchChooseArtwork,
                             onRemoveFromPlaylist = ::removeFromPlaylist,
                         )
                         Page.TAB -> when (screen.tab) {
@@ -809,6 +1117,7 @@ internal fun AftertoneApp(
                                 onToggleFavorite = ::toggleFavorite,
                                 onAddToCollection = ::addToCollection,
                                 onRemoveFromDevice = ::requestRemove,
+                                onChooseArtwork = ::launchChooseArtwork,
                             )
                             AppTab.LIBRARY -> LibraryScreen(
                                 library = library,
@@ -818,6 +1127,7 @@ internal fun AftertoneApp(
                                 onToggleFavorite = ::toggleFavorite,
                                 onAddToCollection = ::addToCollection,
                                 onRemoveFromDevice = ::requestRemove,
+                                onChooseArtwork = ::launchChooseArtwork,
                             )
                             AppTab.SEARCH -> SearchScreen(
                                 library = library,
@@ -827,6 +1137,7 @@ internal fun AftertoneApp(
                                 onToggleFavorite = ::toggleFavorite,
                                 onAddToCollection = ::addToCollection,
                                 onRemoveFromDevice = ::requestRemove,
+                                onChooseArtwork = ::launchChooseArtwork,
                             )
                             AppTab.COLLECTIONS -> CollectionsScreen(
                                 library = library,
@@ -845,6 +1156,7 @@ internal fun AftertoneApp(
                                 onPaletteSelected = onPaletteSelected,
                                 installedVersion = BuildConfig.VERSION_NAME,
                                 onCheckForUpdates = ::openReleasePage,
+                                onOpenLicense = { showLicenseDialog = true },
                                 isBackupBusy = isBackupBusy,
                                 isBackupCancelable = isBackupCancelable,
                                 backupProgressText = backupProgressText,
@@ -865,6 +1177,45 @@ internal fun AftertoneApp(
                 }
             }
         }
+    }
+
+    externalAudioRequest?.takeIf { it.failureKind != null }?.let { failedRequest ->
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text("Не удалось обработать аудиофайл") },
+            text = {
+                Text(
+                    failedRequest.failureMessage ?: "Можно повторить попытку или пропустить файл, чтобы перейти к следующему.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    if (failedRequest.failureKind == ExternalAudioOpenFailureKind.LibraryLoad) {
+                        libraryLoadError = false
+                        isLibraryLoaded = false
+                        libraryLoadAttempt++
+                    }
+                    onExternalAudioRequestFailureChoice(
+                        failedRequest.id,
+                        failedRequest.attempt,
+                        ExternalAudioOpenFailureChoice.Retry,
+                    )
+                }) {
+                    Text("Повторить")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    onExternalAudioRequestFailureChoice(
+                        failedRequest.id,
+                        failedRequest.attempt,
+                        ExternalAudioOpenFailureChoice.Skip,
+                    )
+                }) {
+                    Text("Пропустить")
+                }
+            },
+        )
     }
 
     if (showCreatePlaylist) {
@@ -1005,6 +1356,10 @@ internal fun AftertoneApp(
                 }
             },
         )
+    }
+
+    if (showLicenseDialog) {
+        LicenseNoticeDialog(onDismiss = { showLicenseDialog = false })
     }
 }
 

@@ -4,6 +4,7 @@ import java.io.File
 import java.nio.file.Files
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -29,6 +30,89 @@ class LibraryPersistenceTest {
         )
 
         assertEquals(snapshot, LibraryStateCodec.decode(LibraryStateCodec.encode(snapshot)))
+    }
+
+    @Test
+    fun codecPersistsRequestIdAndCompletedHandoffForRetryAfterProcessRecreation() {
+        val requestId = "f1557c4e-6670-4bc1-a595-914433c9a8d3"
+        val snapshot = LibrarySnapshot(
+            tracks = listOf(
+                Track(
+                    id = "track-1",
+                    title = "External track",
+                    artist = "Test artist",
+                    filePath = "/private/audio/track-1.mp3",
+                    externalImportRequestId = requestId,
+                    externalImportHandoffDispatchStarted = true,
+                    externalImportHandoffCompleted = true,
+                ),
+            ),
+        )
+
+        assertEquals(snapshot, LibraryStateCodec.decode(LibraryStateCodec.encode(snapshot)))
+    }
+
+    @Test
+    fun codecPersistsExplicitNotDispatchedClaimForSafeRetry() {
+        val requestId = "0f37c3a3-0d9a-49c8-9f3d-10de8a548f11"
+        val snapshot = LibrarySnapshot(
+            tracks = listOf(
+                Track(
+                    id = "track-claimed",
+                    title = "Claimed external track",
+                    artist = "Test artist",
+                    filePath = "/private/audio/track-claimed.mp3",
+                    externalImportRequestId = requestId,
+                    externalImportHandoffClaimed = true,
+                    externalImportHandoffDispatchStarted = false,
+                ),
+            ),
+        )
+
+        assertEquals(snapshot, LibraryStateCodec.decode(LibraryStateCodec.encode(snapshot)))
+    }
+
+    @Test
+    fun codecLeavesMissingDispatchMarkerUnknownForLegacyClaimedTrack() {
+        val requestId = "0f37c3a3-0d9a-49c8-9f3d-10de8a548f11"
+        val legacySnapshot = LibrarySnapshot(
+            tracks = listOf(
+                Track(
+                    id = "track-legacy-claim",
+                    title = "Claimed before dispatch state existed",
+                    artist = "Test artist",
+                    filePath = "/private/audio/track-legacy-claim.mp3",
+                    externalImportRequestId = requestId,
+                    externalImportHandoffClaimed = true,
+                ),
+            ),
+        )
+
+        val decoded = LibraryStateCodec.decode(LibraryStateCodec.encode(legacySnapshot)).tracks.single()
+
+        assertTrue(decoded.externalImportHandoffClaimed)
+        assertNull(decoded.externalImportHandoffDispatchStarted)
+    }
+
+    @Test
+    fun codecDefaultsMissingClaimMarkerToFalseForOlderLibraryStates() {
+        val requestId = "f1557c4e-6670-4bc1-a595-914433c9a8d3"
+        val previousVersionSnapshot = LibrarySnapshot(
+            tracks = listOf(
+                Track(
+                    id = "track-legacy",
+                    title = "Previously completed external track",
+                    artist = "Test artist",
+                    filePath = "/private/audio/track-legacy.mp3",
+                    externalImportRequestId = requestId,
+                    externalImportHandoffCompleted = true,
+                ),
+            ),
+        )
+
+        val decoded = LibraryStateCodec.decode(LibraryStateCodec.encode(previousVersionSnapshot))
+        assertFalse(decoded.tracks.single().externalImportHandoffClaimed)
+        assertTrue(decoded.tracks.single().externalImportHandoffCompleted)
     }
 
     @Test

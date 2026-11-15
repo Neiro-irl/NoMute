@@ -53,6 +53,7 @@ fun LibraryScreen(
     onToggleFavorite: (String) -> Unit,
     onAddToCollection: (String) -> Unit,
     onRemoveFromDevice: (Track) -> Unit,
+    onChooseArtwork: (String) -> Unit,
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     val tracks = filterLocalTracks(library.tracks, query)
@@ -125,6 +126,7 @@ fun LibraryScreen(
                             onToggleFavorite = { onToggleFavorite(track.id) },
                             onAddToCollection = { onAddToCollection(track.id) },
                             onRemoveFromDevice = { onRemoveFromDevice(track) },
+                            onChooseArtwork = onChooseArtwork,
                         )
                         HorizontalDivider(color = AftertoneOutline.copy(alpha = 0.72f), thickness = 0.6.dp)
                     }

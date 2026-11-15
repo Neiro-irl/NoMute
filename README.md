@@ -1,43 +1,56 @@
 # Aftertone
 
-Нативный Android-плеер для собственной музыки, сохранённой на телефоне. Интерфейс оптимизирован для небольшого экрана: быстрый доступ к медиатеке, избранному и подборкам, мини-плеер снизу, крупный экран воспроизведения и плавные переходы.(ПОКА НЕ РАБОТАЕТ ПОЖАЛУЙСТА ДОЖДИТЕСЬ РАБОЧЕЙ ВЕРСИИ)
+Aftertone is a native Android music player for audio you keep on your device. The interface is designed for a phone, with a local library, search, favorites, playlists, offline playback, and a compact player. (ПОКА НЕ РАБОТАЕТ ПОЖАЛУЙСТА ДОЖДИТЕСЬ РАБОЧЕЙ ВЕРСИИ)
 
-## Скачать APK
+## Download and verify
 
-Последняя сборка доступна в [GitHub Releases](https://github.com/Neiro-irl/project/releases/latest/download/Aftertone.apk). Репозиторий и Releases публичные.
+Download the latest APK from [GitHub Releases](https://github.com/Neiro-irl/project/releases/latest/download/Aftertone.apk), or choose a version from the [full Releases list](https://github.com/Neiro-irl/project/releases). Releases include `Aftertone.apk` and its `Aftertone.apk.sha256` checksum file.
 
-На POCO X6 Pro открой APK и подтверди установку из выбранного источника, если Android запросит разрешение. Приложение рассчитано на Android 8.0 и новее.
-
-## Что умеет приложение
-
-- Импортировать выбранные через системный файловый пикер аудиофайлы в закрытое хранилище Aftertone.
-- Воспроизводить музыку офлайн и управлять ей из системного медиаплеера/уведомления.
-- Искать треки, отмечать избранное, создавать подборки и удалять копию трека из Aftertone.
-- Выбирать одну из пяти цветовых тем (фирменная Aftertone и четыре палитры); выбор сохраняется на устройстве.
-- Импортировать MP3, M4A, AAC, FLAC, WAV, OGG/OGA, Opus, AMR и 3GP — если формат поддерживается декодером Android на устройстве.
-
-Исходный файл при импорте не изменяется. При удалении приложение удаляет только собственную копию. Автоматическое резервное копирование устройства и облака отключено; ZIP-копия создаётся только по явному запросу пользователя. Для локального воспроизведения не требуется аккаунт или подключение к сети.
-
-## Резервная копия медиатеки
-
-Открой **Настройки → Резервная копия**, чтобы сохранить ZIP в месте, выбранном в системном файловом окне. В архив входят импортированные аудиокопии и обложки, метаданные треков, избранное и локальные подборки. Потоковая или защищённая DRM-музыка в копию не попадает, сеть и широкие разрешения на файлы не используются.
-
-Для восстановления выбери ZIP через системный пикер. Aftertone проверит архив и покажет его состав до подтверждения замены текущей медиатеки. Старые файлы удаляются только после успешного сохранения восстановленной библиотеки; при ошибке или отмене они остаются на месте. Нужен запас свободного места для временной копии и восстановленных файлов. Ограничения: до 2 ГиБ на аудиофайл, 2 МиБ на обложку и 16 ГиБ на ZIP/распакованные данные. Храни архив в выбранном тобой безопасном месте.
-
-Ссылки на плейлисты Apple Music и Spotify не являются аудиофайлами: приложение не скачивает защищённые потоковые треки и не обходит DRM. Импортируй аудио, которым ты владеешь или имеешь право пользоваться.
-
-## Сборка на компьютере
-
-Нужны JDK 21 и Android SDK Platform 37 / Build Tools 37.0.0. Проверки и локальный debug APK можно собрать так:
+After downloading both files into the same folder, verify the APK on Linux or macOS:
 
 ```bash
-./gradlew :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
+sha256sum --check Aftertone.apk.sha256
 ```
 
-Debug APK создаётся в `app/build/outputs/apk/debug/app-debug.apk`.
+On Windows, compare the SHA-256 value printed by this command with the value in the release checksum file:
 
-## Автоматическая сборка APK
+```powershell
+(Get-FileHash .\Aftertone.apk -Algorithm SHA256).Hash
+```
 
-GitHub Actions проверяет unit-тесты, lint и сборку при pull request и каждом push в `main`. После успешной проверки workflow собирает APK и публикует его в Releases; доступна также ручная команда запуска workflow. Уже опубликованные версии не перезаписываются повторным запуском. История версий — во вкладке **Releases**, самый свежий APK всегда доступен по ссылке выше.
+A matching hash confirms that the APK bytes match the checksum published with that release; it is not an independent security audit. The source and the GitHub Actions workflow are available in this repository so users can inspect how releases are built. Open source is not a guarantee that every build is free of vulnerabilities, and no “virus-free” claim is made here.
 
-**Подпись APK:** пока постоянный ключ не настроен в GitHub Actions Secrets, сборка подписывается временным debug-ключом runner; его сертификат может меняться между запусками. Переход на постоянный ключ или его последующая ротация также может изменить сертификат. При несовпадении подписи Android может не принять APK поверх установленной версии — обновление без удаления приложения не обещается. Удаление приложения стирает импортированные аудиокопии и локальные данные. **Перед удалением старой версии сохрани ZIP-копию и убедись, что архив открывается и проходит проверку.** Предыдущие Releases остаются доступными, но скачивание старого APK не возвращает app-private музыку. Для будущих стабильных обновлений сопровождающий репозитория должен настроить постоянные `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS` и `ANDROID_KEY_PASSWORD` в Actions Secrets.
+Aftertone supports Android 8.0 (API 26) and later. Android may ask you to allow APK installation from the source you chose.
+
+## What the app does
+
+- Imports audio selected by you and stores a private copy in Aftertone, leaving the original file unchanged.
+- Plays supported local audio offline and exposes playback controls through Android's media notification/session.
+- Lets you search tracks, manage favorites and playlists, and remove Aftertone's own copy from the device.
+- Offers five color palettes. Generated covers use the selected palette; you can also choose a custom cover for a track.
+- Supports MP3, M4A, AAC, FLAC, WAV, OGG/OGA, Opus, AMR, and 3GP when the device's Android decoder supports the file.
+- Can create and restore a library backup ZIP only when you explicitly choose the backup or restore action.
+
+Aftertone does not upload or stream your imported music or selected cover images to a project server. Music and covers stay in the app's private storage on your device. Listening does not require an account or network connection. The manual update action opens the public Releases page in your browser; it does not send your music or artwork. A backup ZIP is written only to the location you select and is not uploaded by Aftertone.
+
+The backup includes imported audio copies, artwork, track metadata, favorites, and playlists. Before you confirm, Restore inspects the ZIP and shows a summary of track, playlist, and favorite counts plus the combined media size; full audio and artwork integrity is checked during restoration. After confirmation, it extracts and validates files in private staging before switching the library. Cancellation is honored during preparation and before commit begins. If the commit fails, Aftertone attempts to restore the previous snapshot and retains transaction data for recovery if cleanup cannot finish.
+
+Restore needs free space for the uncompressed audio and artwork assets plus a 32 MiB safety reserve; the app checks available space before extraction and again during extraction. For safety, a backup is limited to 16 GiB compressed and 16 GiB of total uncompressed ZIP entries (including the manifest), 40,001 ZIP entries total, 2 GiB per audio file, 2 MiB per cover image, and a 20 MiB manifest. Deflated asset entries with a decompression ratio above 200:1 are rejected. DRM-protected streams and playlist links are not downloaded or bypassed. Import only audio you own or are allowed to use.
+
+## Open source and licenses
+
+The Aftertone application source in this repository is licensed under **GNU GPL version 3 only (GPL-3.0-only)**; see [`LICENSE`](LICENSE). Under **Settings → Open licenses**, the app provides the GPL license and warranty notice. Its **Third-party licenses** page includes the full Apache-2.0 notice for AndroidX ExifInterface 1.4.2, packaged at [`third_party_notices.txt`](app/src/main/res/raw/third_party_notices.txt). Third-party libraries retain their own licenses.
+
+## Build and test from source
+
+Requirements: JDK 21, Android SDK Platform 37, and Android Build Tools 37.0.0. From a clone of this repository, run:
+
+```bash
+./gradlew --no-daemon :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
+```
+
+The debug APK is written to `app/build/outputs/apk/debug/app-debug.apk`. The GitHub Actions workflow in `.github/workflows/android-apk.yml` runs verification for pushes to `main`, pull requests targeting `main`, and manual `workflow_dispatch` runs. Pull requests run verification and upload a debug artifact only; they do not publish a GitHub Release. After verification passes, pushes to `main` and manual `workflow_dispatch` on `main` build the release APK and checksum and create a versioned GitHub Release marked latest; the workflow does not wait for a release to be created. Do not put signing keys or passwords in source control.
+
+### APK signing and local data
+
+If the release workflow is not configured with a persistent signing key, it signs with the runner's temporary Android debug key. That certificate can differ between builds; changing or rotating a signing key can also prevent Android from installing an APK as an in-place update. Removing Aftertone deletes its private audio copies, artwork, playlists, and other local app data. Before uninstalling, export a ZIP backup and verify that the archive opens and passes the app's restore check.
