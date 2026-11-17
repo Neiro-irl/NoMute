@@ -1,0 +1,22 @@
+<resources>
+    <string name="app_name">NoMute</string>
+    <string name="external_audio_queue_persistence_failed">Не удалось сохранить очередь открытия файла. Повтори открытие файла, когда хранилище станет доступно.</string>
+    <string name="external_audio_reopen_required">Доступ к ожидавшему аудиофайлу истёк. Открой его снова из проводника или выбери заново в Aftertone.</string>
+    <string name="choose_track_artwork">Выбрать обложку</string>
+    <string name="change_track_artwork">Изменить обложку</string>
+    <string name="track_artwork_saved">Обложка сохранена на этом устройстве.</string>
+    <string name="track_artwork_save_failed">Не удалось сохранить обложку. Выбери другое изображение и попробуй снова.</string>
+    <string name="library_action_unavailable">Сейчас управление медиатекой временно недоступно. Попробуй позже.</string>
+    <string name="license_section_title">ЛИЦЕНЗИЯ И ОТКРЫТЫЙ КОД</string>
+    <string name="license_section_description">Условия использования, распространения и сведения о гарантиях.</string>
+    <string name="license_action">Открытые лицензии</string>
+    <string name="license_dialog_title">Открытый код и лицензия</string>
+    <string name="third_party_licenses_action">Сторонние лицензии</string>
+    <string name="third_party_licenses_title">Сторонние лицензии</string>
+    <string name="license_copyright">Aftertone — © 2026 Neiro.</string>
+    <string name="license_no_warranty">Программа предоставляется без каких-либо гарантий, если иное прямо не указано. Полные условия смотри в тексте лицензии.</string>
+    <string name="license_conveyance">По GNU GPL-3.0-only ты можешь использовать, изменять и распространять программу при соблюдении условий лицензии.</string>
+    <string name="license_full_text">Полный текст GNU General Public License, версия 3 (29 июня 2007 года):</string>
+    <string name="license_close">Закрыть</string>
+    <string name="license_back">Назад</string>
+</resources>
