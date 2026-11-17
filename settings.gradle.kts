@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "Aftertone"
+rootProject.name = "NoMute"
 include(":app")

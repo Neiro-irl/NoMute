@@ -146,16 +146,16 @@ jobs:
 
       - name: Prepare APK and checksum
         run: |
-          cp app/build/outputs/apk/release/app-release.apk Aftertone.apk
-          sha256sum Aftertone.apk | tee Aftertone.apk.sha256
+          cp app/build/outputs/apk/release/app-release.apk NoMute.apk
+          sha256sum NoMute.apk | tee NoMute.apk.sha256
 
       - name: Save release APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: aftertone-release-${{ github.run_number }}
+          name: nomute-release-${{ github.run_number }}
           path: |
-            Aftertone.apk
-            Aftertone.apk.sha256
+            NoMute.apk
+            NoMute.apk.sha256
           if-no-files-found: error
           retention-days: 90
 
@@ -168,9 +168,9 @@ jobs:
           set -euo pipefail
           signing_mode="${AFTERTONE_SIGNING_MODE:-runner-debug-key}"
           if [ "$signing_mode" = 'runner-debug-key' ]; then
-            notes='Installable Aftertone APK for Android 8.0+. Signed with a temporary GitHub runner debug key; its certificate can change between builds or key changes, so in-place updates are not guaranteed. Uninstalling deletes app-private music and playlists. Export and verify a ZIP backup before uninstalling. Older releases remain available.'
+            notes='Installable NoMute APK for Android 8.0+. Signed with a temporary GitHub runner debug key; its certificate can change between builds or key changes, so in-place updates are not guaranteed. Uninstalling deletes app-private music and playlists. Export and verify a ZIP backup before uninstalling. Older releases remain available.'
           else
-            notes='Installable Aftertone APK for Android 8.0+, signed with the repository-configured persistent release key. Its certificate may differ from earlier APKs or change on later key rotation, so in-place updates are not guaranteed. Uninstalling deletes app-private music and playlists. Export and verify a ZIP backup before uninstalling. Older releases remain available.'
+            notes='Installable NoMute APK for Android 8.0+, signed with the repository-configured persistent release key. Its certificate may differ from earlier APKs or change on later key rotation, so in-place updates are not guaranteed. Uninstalling deletes app-private music and playlists. Export and verify a ZIP backup before uninstalling. Older releases remain available.'
           fi
 
           if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -178,7 +178,7 @@ jobs:
             exit 1
           fi
 
-          gh release create "$TAG_NAME" Aftertone.apk Aftertone.apk.sha256 \
+          gh release create "$TAG_NAME" NoMute.apk NoMute.apk.sha256 \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "$TAG_NAME" \
