@@ -36,6 +36,7 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
@@ -49,6 +50,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.delay
 import androidx.media3.common.Player
 import com.neiro.aftertone.model.Track
 import com.neiro.aftertone.ui.components.ActionPill
@@ -77,7 +79,7 @@ fun NowPlayingScreen(
     onToggleRepeat: () -> Unit,
     onPrevious: () -> Unit,
     onNext: () -> Unit,
-    onSeek: (Long) -> Unit,
+    onSeek: (Long) -> Boolean,
 ) {
     if (track == null) {
         Column(
@@ -94,7 +96,20 @@ fun NowPlayingScreen(
 
     val effectiveDuration = durationMs.takeIf { it > 0 } ?: track.durationMs
     var scrubValue by remember(track.id) { mutableStateOf<Float?>(null) }
-    val progress = if (effectiveDuration > 0) (currentPositionMs.toFloat() / effectiveDuration).coerceIn(0f, 1f) else 0f
+    var pendingSeekPositionMs by remember(track.id) { mutableStateOf<Long?>(null) }
+    LaunchedEffect(track.id, currentPositionMs, pendingSeekPositionMs) {
+        val requestedPositionMs = pendingSeekPositionMs ?: return@LaunchedEffect
+        if (isSeekPositionAcknowledged(currentPositionMs, requestedPositionMs)) {
+            pendingSeekPositionMs = null
+        }
+    }
+    LaunchedEffect(track.id, pendingSeekPositionMs) {
+        val requestedPositionMs = pendingSeekPositionMs ?: return@LaunchedEffect
+        delay(SEEK_PREVIEW_TIMEOUT_MS)
+        if (pendingSeekPositionMs == requestedPositionMs) pendingSeekPositionMs = null
+    }
+    val displayedPositionMs = playbackPositionMsForDisplay(currentPositionMs, pendingSeekPositionMs)
+    val progress = if (effectiveDuration > 0) (displayedPositionMs.toFloat() / effectiveDuration).coerceIn(0f, 1f) else 0f
 
     Column(
         modifier = Modifier.fillMaxSize().padding(horizontal = 22.dp),
@@ -154,12 +169,16 @@ fun NowPlayingScreen(
                 Slider(
                     value = scrubValue ?: progress,
                     onValueChange = { scrubValue = it },
-                    onValueChangeFinished = { scrubValue?.let { onSeek((it * effectiveDuration).toLong()) }; scrubValue = null },
+                    onValueChangeFinished = {
+                        val requestedPositionMs = scrubValue?.let { (it * effectiveDuration).toLong() }
+                        scrubValue = null
+                        pendingSeekPositionMs = requestedPositionMs?.takeIf { onSeek(it) }
+                    },
                     enabled = effectiveDuration > 0,
                     modifier = Modifier.fillMaxWidth().semantics { contentDescription = "Позиция воспроизведения" },
                 )
                 Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text(formatDuration(scrubValue?.let { (it * effectiveDuration).toLong() } ?: currentPositionMs), color = AftertoneMuted, fontSize = 11.sp)
+                    Text(formatDuration(scrubValue?.let { (it * effectiveDuration).toLong() } ?: displayedPositionMs), color = AftertoneMuted, fontSize = 11.sp)
                     Spacer(Modifier.weight(1f))
                     Text(formatDuration(effectiveDuration), color = AftertoneMuted, fontSize = 11.sp)
                 }

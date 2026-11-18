@@ -52,6 +52,7 @@ import androidx.core.net.toUri
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.media3.common.Player
 import com.neiro.aftertone.model.LibrarySnapshot
 import com.neiro.aftertone.model.Playlist
 import com.neiro.aftertone.model.Track
@@ -1134,7 +1135,12 @@ internal fun AftertoneApp(
                                     if (controller?.hasNextMediaItem() == true) controller.seekToNextMediaItem()
                                 }
                             },
-                            onSeek = { position -> restoreActionGate.runIfAllowed { controller?.seekTo(position) } },
+                            onSeek = { position ->
+                                val activeController = controller
+                                activeController != null &&
+                                    activeController.isCommandAvailable(Player.COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM) &&
+                                    restoreActionGate.runIfAllowed { activeController.seekTo(position) }
+                            },
                         )
                         Page.COLLECTION -> CollectionDetailScreen(
                             library = library,
