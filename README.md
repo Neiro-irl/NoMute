@@ -1,6 +1,6 @@
 # NoMute
 
-Aftertone is a native Android music player for audio you keep on your device. The interface is designed for a phone, with a local library, search, favorites, playlists, offline playback, and a compact player.
+NoMute is a native Android music player for audio you keep on your device. The interface is designed for a phone, with a local library, search, favorites, playlists, offline playback, and a compact player.
 
 ## Download and verify
 
