@@ -121,7 +121,7 @@ internal class LibraryRestoreTransaction(
     ): PendingLibraryRestore {
         requireSafeAudioDirectory()
         val transactionId = PrivateAudioPath.restoreStageId(stagingDirectory.name)
-            ?: throw SecurityException("The restore staging path is not owned by Aftertone.")
+            ?: throw SecurityException("The restore staging path is not owned by NoMute.")
         if (!isOwnedStagingDirectory(stagingDirectory, transactionId)) {
             throw SecurityException("The restore staging directory could not be verified.")
         }

@@ -103,7 +103,7 @@ fun SearchScreen(
                     ) {
                         Icon(Icons.Filled.MusicNote, contentDescription = null, tint = AftertoneAccent, modifier = Modifier.size(26.dp))
                         Text("Сначала добавь музыку", color = AftertoneText, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-                        Text("Поиск работает по аудиофайлам, которые ты импортировал в Aftertone.", color = AftertoneMuted, fontSize = 13.sp, lineHeight = 19.sp)
+                        Text("Поиск работает по аудиофайлам, которые ты импортировал в NoMute.", color = AftertoneMuted, fontSize = 13.sp, lineHeight = 19.sp)
                         ActionPill(label = if (isImporting) "Импорт…" else "Выбрать аудио", icon = Icons.Filled.Add, onClick = onImport)
                     }
                 }

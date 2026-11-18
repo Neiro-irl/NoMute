@@ -18,7 +18,7 @@ internal enum class AftertonePalette(
 ) {
     AFTERTONE(
         id = "aftertone",
-        title = "Aftertone",
+        title = "NoMute",
         description = "Тёмная тема с лаймовым акцентом.",
         backgroundArgb = 0xFF050505L,
         surfaceArgb = 0xFF111111L,

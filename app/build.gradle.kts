@@ -19,8 +19,8 @@ android {
         applicationId = providers.gradleProperty("applicationId").orNull ?: "com.neiro.nomute"
         minSdk = 26
         targetSdk = 37
-        versionCode = providers.gradleProperty("versionCode").orNull?.toIntOrNull() ?: 33
-        versionName = providers.gradleProperty("versionName").orNull ?: "1.0.33"
+        versionCode = providers.gradleProperty("versionCode").orNull?.toIntOrNull() ?: 34
+        versionName = providers.gradleProperty("versionName").orNull ?: "1.0.34"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("boolean", "RECOVERY_DIAGNOSTIC_READ_ONLY", recoveryDiagnosticReadOnly.toString())
     }

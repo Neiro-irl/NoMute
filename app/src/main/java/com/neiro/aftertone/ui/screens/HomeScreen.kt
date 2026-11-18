@@ -70,7 +70,7 @@ fun HomeScreen(
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     AftertoneMark()
                     Spacer(Modifier.width(9.dp))
-                    Text("AFTERTONE", color = AftertoneText, fontSize = 12.sp, letterSpacing = 2.1.sp, fontWeight = FontWeight.Bold)
+                    Text("NoMute", color = AftertoneText, fontSize = 12.sp, letterSpacing = 2.1.sp, fontWeight = FontWeight.Bold)
                     Spacer(Modifier.weight(1f))
                     Surface(shape = CircleShape, color = AftertoneSurface) {
                         Text("НА ЭТОМ УСТРОЙСТВЕ", color = AftertoneMuted, fontSize = 9.sp, letterSpacing = 0.7.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(horizontal = 11.dp, vertical = 8.dp))
@@ -108,7 +108,7 @@ fun HomeScreen(
                             Icon(Icons.Filled.LibraryMusic, contentDescription = null, tint = AftertoneAccent, modifier = Modifier.padding(12.dp).size(25.dp))
                         }
                         Text("Добавь музыку, которой владеешь.", color = AftertoneText, fontSize = 21.sp, lineHeight = 26.sp, fontWeight = FontWeight.SemiBold)
-                        Text("Выбери аудиофайлы на телефоне. Aftertone сохранит приватную копию, чтобы слушать её офлайн.", color = AftertoneMuted, fontSize = 13.sp, lineHeight = 19.sp)
+                        Text("Выбери аудиофайлы на телефоне. NoMute сохранит приватную копию, чтобы слушать её офлайн.", color = AftertoneMuted, fontSize = 13.sp, lineHeight = 19.sp)
                         Text("При удалении приложения импортированные копии удалятся, исходные файлы останутся.", color = AftertoneMuted, fontSize = 12.sp, lineHeight = 18.sp)
                         ActionPill(label = if (isImporting) "Импорт…" else "Выбрать аудио", icon = Icons.Filled.Add, onClick = onImport)
                     }

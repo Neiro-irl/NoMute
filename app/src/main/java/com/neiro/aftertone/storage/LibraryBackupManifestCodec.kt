@@ -82,7 +82,7 @@ internal object LibraryBackupManifestCodec {
         val header = ByteArray(magic.size)
         try {
             input.readFully(header)
-            require(header.contentEquals(magic)) { "This is not an Aftertone backup archive." }
+            require(header.contentEquals(magic)) { "This is not a NoMute backup archive." }
             require(input.readInt() == VERSION) { "This backup version is not supported." }
             val stateLength = input.readInt()
             require(stateLength in 1..LibraryStateCodec.MAX_STATE_UTF8_BYTES && stateLength <= input.available()) {

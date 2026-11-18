@@ -1071,7 +1071,7 @@ internal fun AftertoneApp(
                                 "Восстановление ещё не подтверждено. Управление музыкой заблокировано, пока проверяется журнал. Повтори восстановление."
                             }
                         } else {
-                            "Сохранённый список не изменён, а аудиофайлы не удалены. Изменения отключены, чтобы не потерять данные. Не удаляй Aftertone."
+                            "Сохранённый список не изменён, а аудиофайлы не удалены. Изменения отключены, чтобы не потерять данные. Не удаляй NoMute."
                         },
                         color = AftertoneMuted,
                         style = MaterialTheme.typography.bodyMedium,
@@ -1206,7 +1206,7 @@ internal fun AftertoneApp(
                                 restoreSummary = pendingRestoreBackup?.summary,
                                 isRestoreCleanupPending = pendingRestoreCleanupId != null,
                                 isTemporaryArchiveCleanupPending = preparedArchiveOwnerState.cleanupPending,
-                                onCreateBackup = { if (!isBackupBusy) createBackupLauncher.launch("Aftertone_backup.zip") },
+                                onCreateBackup = { if (!isBackupBusy) createBackupLauncher.launch("NoMute_backup.zip") },
                                 onSelectRestore = { if (!isBackupBusy) restoreBackupLauncher.launch(arrayOf("*/*")) },
                                 onCancelBackup = ::cancelBackupOperation,
                                 onConfirmRestore = ::confirmRestore,

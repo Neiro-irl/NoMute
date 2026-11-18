@@ -81,7 +81,7 @@ internal fun SettingsScreen(
                     style = MaterialTheme.typography.headlineLarge,
                 )
                 Text(
-                    text = "Выбери цветовую тему Aftertone. Изменение применяется сразу и сохраняется на этом устройстве.",
+                    text = "Выбери цветовую тему NoMute. Изменение применяется сразу и сохраняется на этом устройстве.",
                     color = AftertoneMuted,
                     style = MaterialTheme.typography.bodyMedium,
                 )
@@ -103,7 +103,7 @@ internal fun SettingsScreen(
         }
         item {
             Text(
-                text = "Тема хранится только в Aftertone на этом устройстве.",
+                text = "Тема хранится только в NoMute на этом устройстве.",
                 color = AftertoneMuted,
                 style = MaterialTheme.typography.bodySmall,
                 modifier = Modifier.padding(top = 2.dp),

@@ -94,7 +94,7 @@ internal fun ConfirmRemoveDialog(track: Track, onDismiss: () -> Unit, onConfirm:
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Удалить этот трек?", fontWeight = FontWeight.SemiBold) },
-        text = { Text("Aftertone удалит свою копию «${track.displayTitle}» из памяти телефона. Исходный файл не изменится.", color = AftertoneMuted) },
+        text = { Text("NoMute удалит свою копию «${track.displayTitle}» из памяти телефона. Исходный файл не изменится.", color = AftertoneMuted) },
         confirmButton = {
             TextButton(onClick = onConfirm) {
                 Text("Удалить", color = MaterialTheme.colorScheme.error)

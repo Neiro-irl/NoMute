@@ -110,7 +110,7 @@ fun LibraryScreen(
                     action = {
                         ActionPill(label = if (isImporting) "Импорт…" else "Выбрать аудио", icon = Icons.Filled.Add, onClick = onImport)
                     },
-                    note = "При удалении Aftertone приватная копия музыки удалится; оригинал останется.",
+                    note = "При удалении NoMute приватная копия музыки удалится; оригинал останется.",
                 )
             }
             else -> {
