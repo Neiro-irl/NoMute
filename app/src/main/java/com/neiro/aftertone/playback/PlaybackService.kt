@@ -1,5 +1,6 @@
 package com.neiro.aftertone.playback
 
+import android.app.PendingIntent
 import android.content.Intent
 import android.os.Process
 import androidx.media3.common.AudioAttributes
@@ -8,6 +9,7 @@ import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import androidx.media3.session.SessionResult
 import androidx.media3.exoplayer.ExoPlayer
+import com.neiro.aftertone.MainActivity
 import com.neiro.aftertone.storage.LocalLibraryRepository
 import com.neiro.aftertone.storage.RestoreActionGate
 
@@ -53,7 +55,17 @@ class PlaybackService : MediaSessionService() {
             .setAudioAttributes(AudioAttributes.DEFAULT, true)
             .setHandleAudioBecomingNoisy(true)
             .build()
+        val sessionActivity = PendingIntent.getActivity(
+            this,
+            0,
+            Intent(this, MainActivity::class.java).apply {
+                action = ACTION_OPEN_NOW_PLAYING
+                flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
         mediaSession = MediaSession.Builder(this, player)
+            .setSessionActivity(sessionActivity)
             .setCallback(trustedControllersOnly)
             .build()
     }

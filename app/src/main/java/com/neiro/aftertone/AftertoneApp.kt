@@ -128,6 +128,7 @@ private const val FAVORITES_COLLECTION_ID = "__aftertone_favorites__"
 internal fun AftertoneApp(
     selectedPalette: AftertonePalette,
     onPaletteSelected: (AftertonePalette) -> Unit,
+    nowPlayingLaunchRequestId: Int = 0,
     externalAudioRequest: ExternalAudioOpenRequest? = null,
     onExternalAudioRequestHandled: (String, Int) -> Unit = { _, _ -> },
     onExternalAudioRequestFailed: (String, Int, ExternalAudioOpenFailureKind, String) -> Unit = { _, _, _, _ -> },
@@ -157,6 +158,12 @@ internal fun AftertoneApp(
     var activeTab by rememberSaveable { mutableStateOf(AppTab.HOME) }
     var openCollectionId by rememberSaveable { mutableStateOf<String?>(null) }
     var showNowPlaying by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(nowPlayingLaunchRequestId) {
+        if (nowPlayingLaunchRequestId > 0) {
+            openCollectionId = null
+            showNowPlaying = true
+        }
+    }
     var showLicenseDialog by rememberSaveable { mutableStateOf(false) }
     var showScopedRecoveryRetryConfirmation by rememberSaveable { mutableStateOf(false) }
     var showCreatePlaylist by remember { mutableStateOf(false) }

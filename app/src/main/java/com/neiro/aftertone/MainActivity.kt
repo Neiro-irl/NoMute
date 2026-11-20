@@ -11,12 +11,15 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.core.net.toUri
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.lifecycleScope
+import com.neiro.aftertone.playback.ACTION_OPEN_NOW_PLAYING
+import com.neiro.aftertone.playback.nextNowPlayingLaunchRequestId
 import com.neiro.aftertone.ui.theme.AftertonePalette
 import com.neiro.aftertone.ui.theme.AftertoneTheme
 import com.neiro.aftertone.ui.theme.SharedPreferencesThemePreferenceStorage
@@ -226,6 +229,7 @@ internal fun externalAudioPersistableReadPermissionFlags(intentFlags: Int): Int 
 class MainActivity : ComponentActivity() {
     private lateinit var externalAudioOpenRequestQueueStore: ExternalAudioOpenRequestQueueStore
     private var externalAudioOpenRequestQueue by mutableStateOf(ExternalAudioOpenRequestQueueSnapshot())
+    private var nowPlayingLaunchRequestId by mutableIntStateOf(0)
     private var undurableExternalAudioRequestQueue: ExternalAudioOpenRequestQueueSnapshot? = null
     private var externalAudioQueueRecoveryDialog: AlertDialog? = null
     private val externalAudioQueueMutationMutex = Mutex()
@@ -234,6 +238,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (savedInstanceState == null) {
+            nowPlayingLaunchRequestId = nextNowPlayingLaunchRequestId(0, intent?.action)
+        }
         val requestPreferences = getSharedPreferences(EXTERNAL_AUDIO_OPEN_REQUEST_QUEUE_PREFERENCES, MODE_PRIVATE)
         externalAudioOpenRequestQueueStore = ExternalAudioOpenRequestQueueStore(
             readEncoded = { requestPreferences.getString(EXTERNAL_AUDIO_OPEN_REQUEST_QUEUE_KEY, null) },
@@ -280,6 +287,7 @@ class MainActivity : ComponentActivity() {
                             selectedPalette = palette
                         }
                     },
+                    nowPlayingLaunchRequestId = nowPlayingLaunchRequestId,
                     externalAudioRequest = if (canProcessExternalAudioQueue(BuildConfig.RECOVERY_DIAGNOSTIC_READ_ONLY)) {
                         pendingExternalAudioRequests.firstOrNull()
                     } else {
@@ -339,6 +347,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        if (intent.action == ACTION_OPEN_NOW_PLAYING) {
+            nowPlayingLaunchRequestId = nextNowPlayingLaunchRequestId(nowPlayingLaunchRequestId, intent.action)
+            return
+        }
         if (!canProcessExternalAudioQueue(BuildConfig.RECOVERY_DIAGNOSTIC_READ_ONLY)) return
         val preparedIntent = prepareExternalAudioOpenIntent(intent)
         preparedIntent.sanitizedIntent?.let(::setIntent)

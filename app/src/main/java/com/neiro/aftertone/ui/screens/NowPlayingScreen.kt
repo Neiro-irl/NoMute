@@ -29,8 +29,10 @@ import androidx.compose.material.icons.filled.RepeatOne
 import androidx.compose.material.icons.filled.Shuffle
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
+import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
@@ -188,13 +190,22 @@ fun NowPlayingScreen(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
-                IconButton(
+                val shuffleColors = playbackToggleColors(
+                    colorScheme = MaterialTheme.colorScheme,
+                    mode = PlaybackToggleMode.SHUFFLE,
+                    active = shuffleModeEnabled,
+                )
+                FilledIconButton(
                     onClick = onToggleShuffle,
                     modifier = Modifier.size(44.dp).semantics {
                         contentDescription = if (shuffleModeEnabled) "Выключить перемешивание" else "Включить перемешивание"
                     },
+                    colors = IconButtonDefaults.filledIconButtonColors(
+                        containerColor = shuffleColors.containerColor,
+                        contentColor = shuffleColors.contentColor,
+                    ),
                 ) {
-                    Icon(Icons.Filled.Shuffle, contentDescription = null, tint = if (shuffleModeEnabled) AftertoneAccent else AftertoneMuted, modifier = Modifier.size(21.dp))
+                    Icon(Icons.Filled.Shuffle, contentDescription = null, modifier = Modifier.size(21.dp))
                 }
                 IconButton(onClick = onPrevious, modifier = Modifier.size(56.dp).semantics { contentDescription = "Предыдущий трек" }) {
                     Icon(Icons.Filled.SkipPrevious, contentDescription = null, tint = AftertoneText, modifier = Modifier.size(30.dp))
@@ -217,7 +228,13 @@ fun NowPlayingScreen(
                 IconButton(onClick = onNext, modifier = Modifier.size(56.dp).semantics { contentDescription = "Следующий трек" }) {
                     Icon(Icons.Filled.SkipNext, contentDescription = null, tint = AftertoneText, modifier = Modifier.size(30.dp))
                 }
-                IconButton(
+                val repeatIcon = if (repeatMode == Player.REPEAT_MODE_ONE) Icons.Filled.RepeatOne else Icons.Filled.Repeat
+                val repeatColors = playbackToggleColors(
+                    colorScheme = MaterialTheme.colorScheme,
+                    mode = PlaybackToggleMode.REPEAT,
+                    active = repeatMode != Player.REPEAT_MODE_OFF,
+                )
+                FilledIconButton(
                     onClick = onToggleRepeat,
                     modifier = Modifier.size(44.dp).semantics {
                         contentDescription = when (repeatMode) {
@@ -226,9 +243,12 @@ fun NowPlayingScreen(
                             else -> "Включить повтор очереди"
                         }
                     },
+                    colors = IconButtonDefaults.filledIconButtonColors(
+                        containerColor = repeatColors.containerColor,
+                        contentColor = repeatColors.contentColor,
+                    ),
                 ) {
-                    val repeatIcon = if (repeatMode == Player.REPEAT_MODE_ONE) Icons.Filled.RepeatOne else Icons.Filled.Repeat
-                    Icon(repeatIcon, contentDescription = null, tint = if (repeatMode == Player.REPEAT_MODE_OFF) AftertoneMuted else AftertoneAccent, modifier = Modifier.size(21.dp))
+                    Icon(repeatIcon, contentDescription = null, modifier = Modifier.size(21.dp))
                 }
             }
             Text("Сохранено на этом телефоне", color = AftertoneMuted.copy(alpha = 0.8f), fontSize = 11.sp, modifier = Modifier.align(Alignment.CenterHorizontally))
