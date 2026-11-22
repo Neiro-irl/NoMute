@@ -54,6 +54,31 @@ class LocalAudioImporterTest {
     }
 
     @Test
+    fun importWithIdUsesTheSameGeneratedPathForRetry() {
+        val directory = Files.createTempDirectory("aftertone-import-stable-id-").toFile()
+        val stableId = "4d9d7fd6-4917-4cb9-90f5-822d37e67b28"
+        try {
+            val importer = LocalAudioImporter(
+                directory,
+                AudioMetadataReader { AudioMetadata(title = "Retry-safe import") },
+                availableBytes = { Long.MAX_VALUE },
+            )
+
+            val imported = importer.importWithId(
+                ByteArrayInputStream(byteArrayOf(2, 4, 8)),
+                "song.mp3",
+                "audio/mpeg",
+                stableId,
+            )
+
+            assertEquals(stableId, imported.id)
+            assertEquals("$stableId.mp3", File(imported.filePath).name)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
     fun syncsAudioAndEmbeddedArtworkBeforePublishingTheTrack() {
         val directory = Files.createTempDirectory("aftertone-import-durable-").toFile()
         val events = mutableListOf<String>()

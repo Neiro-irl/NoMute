@@ -22,6 +22,59 @@ class LibraryDomainTest {
     }
 
     @Test
+    fun collectionTracksFollowPlaylistOrderInsteadOfLibraryOrder() {
+        val firstTrack = Track("first", "First", "Artist", filePath = "/audio/first.mp3")
+        val secondTrack = Track("second", "Second", "Artist", filePath = "/audio/second.mp3")
+        val playlist = Playlist("mix", "Mix", listOf("second", "first"))
+
+        assertEquals(listOf(secondTrack, firstTrack), playlist.tracksInOrder(listOf(firstTrack, secondTrack)))
+    }
+
+    @Test
+    fun movingAPlaylistTrackChangesOnlyItsPositionAndIgnoresMissingIds() {
+        val playlist = Playlist("mix", "Mix", listOf("first", "second", "third"))
+
+        assertEquals(listOf("second", "first", "third"), playlist.moveTrack("second", 0).trackIds)
+        assertEquals(playlist, playlist.moveTrack("missing", 0))
+        assertEquals(playlist, playlist.moveTrack("first", 3))
+    }
+
+    @Test
+    fun movingALibraryTrackChangesOnlyItsPosition() {
+        val first = Track("first", "First", "Artist", filePath = "/audio/first.mp3")
+        val second = Track("second", "Second", "Artist", filePath = "/audio/second.mp3")
+        val third = Track("third", "Third", "Artist", filePath = "/audio/third.mp3")
+        val playlist = Playlist("mix", "Mix", listOf("third", "first"))
+        val snapshot = LibrarySnapshot(
+            tracks = listOf(first, second, third),
+            playlists = listOf(playlist),
+            favoriteTrackIds = setOf("second"),
+        )
+
+        val moved = snapshot.moveTrack("second", 0)
+
+        assertEquals(listOf("second", "first", "third"), moved.tracks.map(Track::id))
+        assertEquals(listOf(playlist), moved.playlists)
+        assertEquals(setOf("second"), moved.favoriteTrackIds)
+        assertEquals(listOf("first", "second", "third"), snapshot.tracks.map(Track::id))
+    }
+
+    @Test
+    fun libraryTrackMoveIgnoresMissingIdsAndInvalidOrUnchangedPositions() {
+        val snapshot = LibrarySnapshot(
+            tracks = listOf(
+                Track("first", "First", "Artist", filePath = "/audio/first.mp3"),
+                Track("second", "Second", "Artist", filePath = "/audio/second.mp3"),
+            ),
+        )
+
+        assertEquals(snapshot, snapshot.moveTrack("missing", 0))
+        assertEquals(snapshot, snapshot.moveTrack("first", -1))
+        assertEquals(snapshot, snapshot.moveTrack("first", 2))
+        assertEquals(snapshot, snapshot.moveTrack("first", 0))
+    }
+
+    @Test
     fun importedFilenameNeverUsesTheDocumentPath() {
         val result = TrackFileName.forImport(
             id = "track-01",

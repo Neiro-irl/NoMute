@@ -7,6 +7,7 @@ import android.system.Os
 import android.system.OsConstants
 import androidx.exifinterface.media.ExifInterface
 import com.neiro.aftertone.model.PrivateAudioPath
+import com.neiro.aftertone.model.PlaylistArtworkFileName
 import com.neiro.aftertone.model.TrackArtworkFileName
 import java.io.File
 import java.io.FileOutputStream
@@ -22,6 +23,10 @@ internal fun interface TrackArtworkImporter {
     fun import(trackId: String, input: InputStream): String
 }
 
+internal fun interface PlaylistArtworkImporter {
+    fun importPlaylistArtwork(playlistId: String, input: InputStream): String
+}
+
 internal fun interface ArtworkImageProcessor {
     fun process(source: File, destination: File)
 }
@@ -34,9 +39,30 @@ internal class LocalArtworkImporter(
     private val audioDirectory: File,
     private val imageProcessor: ArtworkImageProcessor = AndroidArtworkImageProcessor(),
     private val directorySynchronizer: ArtworkDirectorySynchronizer = AndroidArtworkDirectorySynchronizer(),
-) : TrackArtworkImporter {
+) : TrackArtworkImporter, PlaylistArtworkImporter {
     override fun import(trackId: String, input: InputStream): String {
         require(trackId.matches(SAFE_TRACK_ID)) { "The track ID is not a safe file name." }
+        return importArtwork(
+            finalFileName = TrackArtworkFileName.forCustomCover(trackId),
+            isOwnedFileName = { fileName -> TrackArtworkFileName.isGeneratedFileName(trackId, fileName) },
+            input = input,
+        )
+    }
+
+    override fun importPlaylistArtwork(playlistId: String, input: InputStream): String {
+        require(PlaylistArtworkFileName.isSafePlaylistId(playlistId)) { "The playlist ID is not a safe file name." }
+        return importArtwork(
+            finalFileName = PlaylistArtworkFileName.forCustomCover(playlistId),
+            isOwnedFileName = { fileName -> PlaylistArtworkFileName.isGeneratedFileName(playlistId, fileName) },
+            input = input,
+        )
+    }
+
+    private fun importArtwork(
+        finalFileName: String,
+        isOwnedFileName: (String) -> Boolean,
+        input: InputStream,
+    ): String {
         ensureAudioDirectory()
 
         val stagedSource = createStageFile(".part")
@@ -49,19 +75,22 @@ internal class LocalArtworkImporter(
             requireValidProcessedImage(stagedArtwork)
             RandomAccessFile(stagedArtwork, "rw").use { it.fd.sync() }
 
-            val finalArtwork = File(audioDirectory, TrackArtworkFileName.forCustomCover(trackId))
-            if (!PrivateAudioPath.isDirectChild(audioDirectory, finalArtwork) || finalArtwork.exists()) {
+            val finalArtwork = File(audioDirectory, finalFileName)
+            if (!isOwnedFileName(finalArtwork.name) ||
+                !PrivateAudioPath.isDirectChild(audioDirectory, finalArtwork) ||
+                finalArtwork.exists()
+            ) {
                 throw IOException("Could not safely publish the selected cover image.")
             }
             Files.move(stagedArtwork.toPath(), finalArtwork.toPath(), StandardCopyOption.ATOMIC_MOVE)
             publishedArtwork = finalArtwork
             directorySynchronizer.sync(audioDirectory)
-            if (!isOwnedGeneratedArtwork(trackId, finalArtwork)) {
+            if (!isOwnedGeneratedArtwork(finalArtwork, isOwnedFileName)) {
                 throw SecurityException("The cover image was published outside private storage.")
             }
             return finalArtwork.canonicalPath
         } catch (error: Exception) {
-            publishedArtwork?.let { file -> runCatching { deleteGeneratedArtwork(trackId, file) } }
+            publishedArtwork?.let { file -> runCatching { deleteGeneratedArtwork(file, isOwnedFileName) } }
             throw error
         } finally {
             deleteStageFile(stagedSource)
@@ -123,14 +152,14 @@ internal class LocalArtworkImporter(
         }
     }
 
-    private fun isOwnedGeneratedArtwork(trackId: String, file: File): Boolean =
-        TrackArtworkFileName.isGeneratedFileName(trackId, file.name) &&
+    private fun isOwnedGeneratedArtwork(file: File, isOwnedFileName: (String) -> Boolean): Boolean =
+        isOwnedFileName(file.name) &&
             !Files.isSymbolicLink(file.toPath()) &&
             Files.isRegularFile(file.toPath(), LinkOption.NOFOLLOW_LINKS) &&
             PrivateAudioPath.isDirectChild(audioDirectory, file)
 
-    private fun deleteGeneratedArtwork(trackId: String, file: File) {
-        if (isOwnedGeneratedArtwork(trackId, file)) Files.deleteIfExists(file.toPath())
+    private fun deleteGeneratedArtwork(file: File, isOwnedFileName: (String) -> Boolean) {
+        if (isOwnedGeneratedArtwork(file, isOwnedFileName)) Files.deleteIfExists(file.toPath())
     }
 
     private fun deleteStageFile(file: File) {

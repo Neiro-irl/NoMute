@@ -1,6 +1,8 @@
 package com.neiro.aftertone.storage
 
 import com.neiro.aftertone.model.LibrarySnapshot
+import com.neiro.aftertone.model.Playlist
+import com.neiro.aftertone.model.PlaylistArtworkFileName
 import com.neiro.aftertone.model.Track
 import java.io.File
 import java.nio.file.Files
@@ -101,23 +103,26 @@ class ScopedNoJournalRecoveryCleanupTest {
     }
 
     @Test
-    fun ownerMarkedStagingIsPreservedWhenItsAudioPathIsInTheActiveSnapshot() {
+    fun ownerMarkedStagingIsPreservedWhenItsPlaylistArtworkIsInTheActiveSnapshot() {
         val root = Files.createTempDirectory("aftertone-active-staged-audio-").toFile()
         val filesDirectory = File(root, "files").apply { mkdir() }
         val audioDirectory = File(filesDirectory, "audio").apply { mkdir() }
         val stagingId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
         val stagingDirectory = File(audioDirectory, ".aftertone-restore-stage-$stagingId").apply { mkdir() }
         File(stagingDirectory, ".aftertone-restore-owner").writeText(stagingId)
-        val activeAudio = File(stagingDirectory, "active-1.mp3").apply { writeBytes(byteArrayOf(9, 8, 7)) }
+        val activeArtwork = File(
+            stagingDirectory,
+            PlaylistArtworkFileName.forCustomCover("active-playlist", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+        ).apply { writeBytes(byteArrayOf(9, 8, 7)) }
         val snapshot = LibrarySnapshot(
-            tracks = listOf(Track("active-1", "Active", "Artist", "", 1_000, activeAudio.absolutePath, null)),
+            playlists = listOf(Playlist("active-playlist", "Active", artworkPath = activeArtwork.absolutePath)),
         )
 
         try {
             transaction(filesDirectory, audioDirectory, snapshot).recoverInterruptedRestore()
 
-            assertTrue("Even owner-marked staging cannot delete a track referenced by the active snapshot.", stagingDirectory.isDirectory)
-            assertTrue(activeAudio.isFile)
+            assertTrue("Even owner-marked staging cannot delete playlist artwork referenced by the active snapshot.", stagingDirectory.isDirectory)
+            assertTrue(activeArtwork.isFile)
         } finally {
             root.deleteRecursively()
         }

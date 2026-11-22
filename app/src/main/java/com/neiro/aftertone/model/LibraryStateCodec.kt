@@ -12,7 +12,8 @@ import java.util.UUID
 import java.util.concurrent.CancellationException
 
 object LibraryStateCodec {
-    private const val VERSION = "1"
+    private const val LEGACY_VERSION = "1"
+    private const val VERSION = "2"
     internal const val MAX_STATE_CHARS = 5 * 1024 * 1024
     internal const val MAX_STATE_UTF8_BYTES = 16 * 1024 * 1024
     private const val MAX_TRACKS = 20_000
@@ -57,6 +58,7 @@ object LibraryStateCodec {
                 val prefix = "playlist.$index."
                 setProperty(prefix + "id", playlist.id)
                 setProperty(prefix + "name", playlist.name)
+                playlist.artworkPath?.let { setProperty(prefix + "artwork", it) }
                 setProperty(prefix + "tracks.count", playlist.trackIds.size.toString())
                 playlist.trackIds.forEachIndexed { trackIndex, trackId ->
                     setProperty(prefix + "track.$trackIndex", trackId)
@@ -96,7 +98,10 @@ object LibraryStateCodec {
             throw IllegalArgumentException("The saved local library state is unreadable.", error)
         }
         checkCancelled()
-        require(properties.getProperty("version") == VERSION) { "The saved local library version is unsupported." }
+        val version = properties.getProperty("version")
+        require(version == LEGACY_VERSION || version == VERSION) {
+            "The saved local library version is unsupported."
+        }
 
         val trackCount = properties.readCount("tracks.count", MAX_TRACKS)
         val tracks = ArrayList<Track>(trackCount)
@@ -161,7 +166,16 @@ object LibraryStateCodec {
                 }
                 trackIds += trackId
             }
-            playlists += Playlist(id, name, trackIds)
+            playlists += Playlist(
+                id = id,
+                name = name,
+                trackIds = trackIds,
+                artworkPath = if (version == VERSION) {
+                    properties.getProperty(prefix + "artwork")?.takeIf(String::isNotBlank)
+                } else {
+                    null
+                },
+            )
         }
 
         val favoriteCount = properties.readCount("favorites.count", MAX_TRACKS)
@@ -218,6 +232,7 @@ object LibraryStateCodec {
             estimate += 256L + playlist.trackIds.size * 32L
             add(playlist.id)
             add(playlist.name)
+            add(playlist.artworkPath.orEmpty())
             playlist.trackIds.forEach(::add)
         }
         snapshot.favoriteTrackIds.forEach(::add)

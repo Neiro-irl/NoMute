@@ -4,6 +4,8 @@ import android.content.Context
 import android.content.ContextWrapper
 import android.content.SharedPreferences
 import android.net.TestUri
+import com.neiro.aftertone.BatchImportState
+import com.neiro.aftertone.BatchImportStatus
 import com.neiro.aftertone.ExternalAudioHandoffDispatchOutcome
 import com.neiro.aftertone.ExternalAudioImportProcessState
 import com.neiro.aftertone.ExternalAudioOpenNotificationQueue
@@ -14,6 +16,7 @@ import com.neiro.aftertone.model.LibrarySnapshot
 import com.neiro.aftertone.model.PrivateAudioPath
 import com.neiro.aftertone.model.Track
 import com.neiro.aftertone.model.TrackArtworkFileName
+import com.neiro.aftertone.model.PlaylistArtworkFileName
 import com.neiro.aftertone.model.TrackFileName
 import java.io.ByteArrayInputStream
 import java.io.File
@@ -117,6 +120,183 @@ class LocalLibraryRepositoryImportTest {
             repositoryFixture.repository.import(TestUri(TEST_URI))
 
             assertEquals(listOf(repositoryFixture.audioDirectory.parentFile, repositoryFixture.audioDirectory), syncedDirectories)
+        } finally {
+            repositoryFixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun retryingBatchItemWithSameIdReturnsExistingTrackWithoutOpeningUriAgain() {
+        val batchItemId = "00000000-0000-0000-0000-000000000071"
+        var openedDocumentCount = 0
+        val repositoryFixture = repositoryFixture(
+            documentSource = AudioDocumentSource { uri ->
+                openedDocumentCount++
+                assertEquals(TEST_URI, uri.toString())
+                AudioImportDocument(ByteArrayInputStream(mp3Fixture()), "tone-01.mp3", "audio/mpeg")
+            },
+        ) { audioDirectory ->
+            LocalAudioImporter(
+                audioDirectory,
+                AudioMetadataReader { AudioMetadata(title = "Stable batch import") },
+                { Long.MAX_VALUE },
+            )
+        }
+
+        try {
+            val imported = repositoryFixture.repository.importBatch(TestUri(TEST_URI), batchItemId)
+            val retried = repositoryFixture.repository.importBatch(TestUri(TEST_URI), batchItemId)
+
+            assertEquals(imported, retried)
+            assertEquals(1, openedDocumentCount)
+            assertEquals(1, repositoryFixture.repository.load().tracks.count { it.id == batchItemId })
+        } finally {
+            repositoryFixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun retryingRestoredInterruptedBatchAfterCommitReusesCommittedTrack() {
+        val batchItemId = "00000000-0000-0000-0000-000000000072"
+        var openedDocumentCount = 0
+        val repositoryFixture = repositoryFixture(
+            documentSource = AudioDocumentSource { uri ->
+                openedDocumentCount++
+                assertEquals(TEST_URI, uri.toString())
+                AudioImportDocument(ByteArrayInputStream(mp3Fixture()), "tone-01.mp3", "audio/mpeg")
+            },
+        ) { audioDirectory ->
+            LocalAudioImporter(
+                audioDirectory,
+                AudioMetadataReader { AudioMetadata(title = "Committed before interruption") },
+                { Long.MAX_VALUE },
+            )
+        }
+
+        try {
+            val pending = BatchImportState.fromDocuments(
+                listOf(TEST_URI to "tone-01.mp3"),
+                idFactory = { batchItemId },
+            )
+            val committedTrack = repositoryFixture.repository.importBatch(TestUri(TEST_URI), batchItemId)
+            val restoredRetry = BatchImportState.restoreFromSavedState(
+                pending.markImporting(batchItemId).toSavedState(),
+            ).retryFailed()
+
+            val completed = runBlocking {
+                restoredRetry.processPending(
+                    importItem = { item ->
+                        repositoryFixture.repository.importBatch(TestUri(item.uri), item.id).id
+                    },
+                    failureMessage = { it.message ?: "Import failed." },
+                )
+            }
+
+            assertEquals(BatchImportStatus.IMPORTED, completed.items.single().status)
+            assertEquals(committedTrack.id, completed.items.single().trackId)
+            assertEquals(1, openedDocumentCount)
+            assertEquals(1, repositoryFixture.repository.load().tracks.size)
+        } finally {
+            repositoryFixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun permissionFailureForOneBatchUriLeavesOtherUrisImported() {
+        val firstUri = "content://test/audio/first"
+        val deniedUri = "content://test/audio/denied"
+        val lastUri = "content://test/audio/last"
+        val itemIds = listOf(
+            "00000000-0000-0000-0000-000000000073",
+            "00000000-0000-0000-0000-000000000074",
+            "00000000-0000-0000-0000-000000000075",
+        )
+        val ids = itemIds.iterator()
+        val openedUris = mutableListOf<String>()
+        val repositoryFixture = repositoryFixture(
+            documentSource = AudioDocumentSource { uri ->
+                val value = uri.toString()
+                openedUris += value
+                if (value == deniedUri) throw SecurityException("The document permission was revoked.")
+                AudioImportDocument(ByteArrayInputStream(mp3Fixture()), "tone-01.mp3", "audio/mpeg")
+            },
+        ) { audioDirectory ->
+            LocalAudioImporter(
+                audioDirectory,
+                AudioMetadataReader { AudioMetadata(title = "Batch import") },
+                { Long.MAX_VALUE },
+            )
+        }
+
+        try {
+            val pending = BatchImportState.fromDocuments(
+                listOf(firstUri to "first.mp3", deniedUri to "denied.mp3", lastUri to "last.mp3"),
+                idFactory = { ids.next() },
+            )
+            val completed = runBlocking {
+                pending.processPending(
+                    importItem = { item ->
+                        repositoryFixture.repository.importBatch(TestUri(item.uri), item.id).id
+                    },
+                    failureMessage = { it.message ?: "Import failed." },
+                )
+            }
+
+            assertEquals(
+                listOf(BatchImportStatus.IMPORTED, BatchImportStatus.FAILED, BatchImportStatus.IMPORTED),
+                completed.items.map { it.status },
+            )
+            assertEquals(itemIds[0], completed.items[0].trackId)
+            assertEquals(itemIds[2], completed.items[2].trackId)
+            assertNotNull(completed.items[1].failureMessage)
+            assertEquals(listOf(firstUri, deniedUri, lastUri), openedUris)
+            assertEquals(setOf(itemIds[0], itemIds[2]), repositoryFixture.repository.load().tracks.map { it.id }.toSet())
+        } finally {
+            repositoryFixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun retryingBatchAfterPreCommitCrashCleansOnlyItsStableIdArtifacts() {
+        val batchItemId = "00000000-0000-0000-0000-000000000076"
+        val unrelatedId = "00000000-0000-0000-0000-000000000077"
+        val coverId = "00000000-0000-0000-0000-000000000078"
+        var openedDocumentCount = 0
+        val repositoryFixture = repositoryFixture(
+            documentSource = AudioDocumentSource { uri ->
+                openedDocumentCount++
+                assertEquals(TEST_URI, uri.toString())
+                AudioImportDocument(ByteArrayInputStream(mp3Fixture()), "tone-01.mp3", "audio/mpeg")
+            },
+        ) { audioDirectory ->
+            LocalAudioImporter(
+                audioDirectory,
+                AudioMetadataReader { AudioMetadata(title = "Retried after crash") },
+                { Long.MAX_VALUE },
+            )
+        }
+
+        try {
+            repositoryFixture.repository.load()
+            assertTrue("Create the audio directory before seeding simulated crash artifacts.", repositoryFixture.audioDirectory.mkdirs())
+            val abandonedPart = File(repositoryFixture.audioDirectory, "$batchItemId.part").apply { writeBytes(byteArrayOf(1)) }
+            val abandonedAudio = File(repositoryFixture.audioDirectory, "$batchItemId.mp3").apply { writeBytes(byteArrayOf(2)) }
+            val abandonedCover = File(
+                repositoryFixture.audioDirectory,
+                TrackArtworkFileName.forCustomCover(batchItemId, coverId),
+            ).apply { writeBytes(byteArrayOf(3)) }
+            val unrelatedPart = File(repositoryFixture.audioDirectory, "$unrelatedId.part").apply { writeBytes(byteArrayOf(4)) }
+            val unrelatedAudio = File(repositoryFixture.audioDirectory, "$unrelatedId.mp3").apply { writeBytes(byteArrayOf(5)) }
+
+            val imported = repositoryFixture.repository.importBatch(TestUri(TEST_URI), batchItemId)
+
+            assertEquals(batchItemId, imported.id)
+            assertFalse(abandonedPart.exists())
+            assertFalse(abandonedCover.exists())
+            assertTrue(abandonedAudio.readBytes().contentEquals(mp3Fixture()))
+            assertTrue(unrelatedPart.isFile)
+            assertTrue(unrelatedAudio.isFile)
+            assertEquals(1, openedDocumentCount)
         } finally {
             repositoryFixture.root.deleteRecursively()
         }
@@ -744,6 +924,340 @@ class LocalLibraryRepositoryImportTest {
     }
 
     @Test
+    fun setPlaylistArtworkPersistsOwnedCoverAndSurvivesRepositoryReload() {
+        val artworkBytes = byteArrayOf(71, 72, 73, 74)
+        val coverId = "323e4567-e89b-12d3-a456-426614174000"
+        val repositoryFixture = repositoryFixture(
+            playlistArtworkImporterFactory = { audioDirectory ->
+                PlaylistArtworkImporter { playlistId, input ->
+                    File(audioDirectory, PlaylistArtworkFileName.forCustomCover(playlistId, coverId))
+                        .apply { writeBytes(input.use { it.readBytes() }) }
+                        .canonicalPath
+                }
+            },
+        ) { playableTrackImporter(it) }
+
+        try {
+            repositoryFixture.repository.import(TestUri(TEST_URI))
+            val playlist = repositoryFixture.repository.addPlaylist("Offline collection").playlists.single()
+
+            val updated = repositoryFixture.repository.setPlaylistArtwork(
+                playlist.id,
+                ByteArrayInputStream(artworkBytes),
+            )
+            val stored = updated.playlists.single()
+            val artwork = File(requireNotNull(stored.artworkPath))
+
+            assertEquals(
+                File(repositoryFixture.audioDirectory, PlaylistArtworkFileName.forCustomCover(playlist.id, coverId)).canonicalPath,
+                artwork.canonicalPath,
+            )
+            assertTrue(artwork.isFile)
+            assertArrayEquals(artworkBytes, artwork.readBytes())
+            assertEquals(stored.artworkPath, repositoryFixture.newRepository().load().playlists.single().artworkPath)
+        } finally {
+            repositoryFixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun failedPlaylistArtworkImportKeepsThePreviousCoverAndState() {
+        val firstCoverId = "423e4567-e89b-12d3-a456-426614174000"
+        val failNextImport = AtomicReference(false)
+        val repositoryFixture = repositoryFixture(
+            playlistArtworkImporterFactory = { audioDirectory ->
+                PlaylistArtworkImporter { playlistId, input ->
+                    val bytes = input.use { it.readBytes() }
+                    if (failNextImport.getAndSet(false)) throw IOException("injected image processing failure")
+                    File(audioDirectory, PlaylistArtworkFileName.forCustomCover(playlistId, firstCoverId))
+                        .apply { writeBytes(bytes) }
+                        .canonicalPath
+                }
+            },
+        ) { playableTrackImporter(it) }
+
+        try {
+            repositoryFixture.repository.import(TestUri(TEST_URI))
+            val playlist = repositoryFixture.repository.addPlaylist("Import failure").playlists.single()
+            val previous = repositoryFixture.repository.setPlaylistArtwork(
+                playlist.id,
+                ByteArrayInputStream(byteArrayOf(1, 2, 3)),
+            ).playlists.single().artworkPath
+            failNextImport.set(true)
+
+            assertThrows(IOException::class.java) {
+                repositoryFixture.repository.setPlaylistArtwork(playlist.id, ByteArrayInputStream(byteArrayOf(4, 5, 6)))
+            }
+
+            assertEquals(previous, repositoryFixture.repository.load().playlists.single().artworkPath)
+            assertTrue(File(requireNotNull(previous)).isFile)
+        } finally {
+            repositoryFixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun failedPlaylistArtworkCommitKeepsThePreviousCoverAndRemovesTheCandidate() {
+        val coverIds = listOf(
+            "523e4567-e89b-12d3-a456-426614174000",
+            "623e4567-e89b-12d3-a456-426614174000",
+        )
+        var coverIndex = 0
+        val repositoryFixture = repositoryFixture(
+            playlistArtworkImporterFactory = { audioDirectory ->
+                PlaylistArtworkImporter { playlistId, input ->
+                    val coverId = coverIds[coverIndex++]
+                    File(audioDirectory, PlaylistArtworkFileName.forCustomCover(playlistId, coverId))
+                        .apply { writeBytes(input.use { it.readBytes() }) }
+                        .canonicalPath
+                }
+            },
+        ) { playableTrackImporter(it) }
+
+        try {
+            repositoryFixture.repository.import(TestUri(TEST_URI))
+            val playlist = repositoryFixture.repository.addPlaylist("Commit failure").playlists.single()
+            val original = repositoryFixture.repository.setPlaylistArtwork(
+                playlist.id,
+                ByteArrayInputStream(byteArrayOf(11, 12, 13)),
+            ).playlists.single().artworkPath
+            val candidate = File(
+                repositoryFixture.audioDirectory,
+                PlaylistArtworkFileName.forCustomCover(playlist.id, coverIds.last()),
+            )
+            repositoryFixture.preferences.failNextCommitBeforeApplyingWrite()
+
+            assertThrows(IOException::class.java) {
+                repositoryFixture.repository.setPlaylistArtwork(playlist.id, ByteArrayInputStream(byteArrayOf(21, 22, 23)))
+            }
+
+            assertEquals(original, repositoryFixture.repository.load().playlists.single().artworkPath)
+            assertTrue(File(requireNotNull(original)).isFile)
+            assertFalse(candidate.exists())
+        } finally {
+            repositoryFixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun playlistArtworkImportCannotClaimATrackFile() {
+        val trackPath = AtomicReference<String?>(null)
+        val repositoryFixture = repositoryFixture(
+            playlistArtworkImporterFactory = { _ ->
+                PlaylistArtworkImporter { _, input ->
+                    input.close()
+                    requireNotNull(trackPath.get())
+                }
+            },
+        ) { audioDirectory ->
+            AudioTrackImporter { input, _, _ ->
+                input.close()
+                val trackId = UUID.randomUUID().toString()
+                val audio = File(audioDirectory, TrackFileName.forImport(trackId, "tone-01.mp3", "audio/mpeg")!!)
+                    .apply { writeBytes(mp3Fixture()) }
+                trackPath.set(audio.canonicalPath)
+                Track(trackId, "Owned audio", "Test artist", durationMs = 1_000L, filePath = audio.canonicalPath)
+            }
+        }
+
+        try {
+            repositoryFixture.repository.import(TestUri(TEST_URI))
+            val playlist = repositoryFixture.repository.addPlaylist("Do not claim audio").playlists.single()
+            val audio = File(requireNotNull(trackPath.get()))
+
+            assertThrows(SecurityException::class.java) {
+                repositoryFixture.repository.setPlaylistArtwork(playlist.id, ByteArrayInputStream(byteArrayOf(1, 2, 3)))
+            }
+
+            assertTrue("Rejecting a bad image path must never delete or replace the owned audio.", audio.isFile)
+            assertEquals(null, repositoryFixture.repository.load().playlists.single().artworkPath)
+        } finally {
+            repositoryFixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun removingPlaylistDeletesOnlyItsOwnCoverAndPreservesTrackAssetsAndOtherPlaylists() {
+        val playlistCoverIds = listOf(
+            "723e4567-e89b-12d3-a456-426614174000",
+            "823e4567-e89b-12d3-a456-426614174000",
+        )
+        val trackCoverId = "923e4567-e89b-12d3-a456-426614174000"
+        var playlistCoverIndex = 0
+        val repositoryFixture = repositoryFixture(
+            artworkImporterFactory = { audioDirectory ->
+                TrackArtworkImporter { trackId, input ->
+                    File(audioDirectory, TrackArtworkFileName.forCustomCover(trackId, trackCoverId))
+                        .apply { writeBytes(input.use { it.readBytes() }) }
+                        .canonicalPath
+                }
+            },
+            playlistArtworkImporterFactory = { audioDirectory ->
+                PlaylistArtworkImporter { playlistId, input ->
+                    val coverId = playlistCoverIds[playlistCoverIndex++]
+                    File(audioDirectory, PlaylistArtworkFileName.forCustomCover(playlistId, coverId))
+                        .apply { writeBytes(input.use { it.readBytes() }) }
+                        .canonicalPath
+                }
+            },
+        ) { playableTrackImporter(it) }
+
+        try {
+            val track = repositoryFixture.repository.import(TestUri(TEST_URI))
+            val withTrackArtwork = repositoryFixture.repository.setTrackArtwork(
+                track.id,
+                ByteArrayInputStream(byteArrayOf(31, 32, 33)),
+            ).tracks.single()
+            val firstPlaylist = repositoryFixture.repository.addPlaylist("First collection").playlists.last()
+            val secondPlaylist = repositoryFixture.repository.addPlaylist("Second collection").playlists.last()
+            val withFirstCover = repositoryFixture.repository.setPlaylistArtwork(
+                firstPlaylist.id,
+                ByteArrayInputStream(byteArrayOf(41, 42, 43)),
+            )
+            val firstCover = File(requireNotNull(withFirstCover.playlists.first { it.id == firstPlaylist.id }.artworkPath))
+            val withBothCovers = repositoryFixture.repository.setPlaylistArtwork(
+                secondPlaylist.id,
+                ByteArrayInputStream(byteArrayOf(51, 52, 53)),
+            )
+            val secondCover = File(requireNotNull(withBothCovers.playlists.first { it.id == secondPlaylist.id }.artworkPath))
+            val trackArtwork = File(requireNotNull(withTrackArtwork.artworkPath))
+            val audio = File(withTrackArtwork.filePath)
+
+            val removed = repositoryFixture.repository.removePlaylist(firstPlaylist.id)
+
+            assertFalse(firstCover.exists())
+            assertTrue(secondCover.isFile)
+            assertTrue(trackArtwork.isFile)
+            assertTrue(audio.isFile)
+            assertEquals(listOf(secondPlaylist.id), removed.playlists.map { it.id })
+            assertEquals(secondCover.canonicalPath, removed.playlists.single().artworkPath)
+        } finally {
+            repositoryFixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun removingPlaylistReturnsCommittedSnapshotWhenCoverDirectorySyncFails() {
+        val coverId = "a23e4567-e89b-12d3-a456-426614174000"
+        val failNextDirectorySync = AtomicReference(false)
+        val syncFailureObserved = AtomicReference(false)
+        val durability = object : AudioImportDurability {
+            override fun syncFile(file: File) = Unit
+
+            override fun syncDirectory(directory: File) {
+                if (failNextDirectorySync.getAndSet(false)) {
+                    syncFailureObserved.set(true)
+                    throw IOException("injected directory-sync failure")
+                }
+            }
+        }
+        val repositoryFixture = repositoryFixture(
+            durability = durability,
+            playlistArtworkImporterFactory = { audioDirectory ->
+                PlaylistArtworkImporter { playlistId, input ->
+                    audioDirectory.mkdirs()
+                    File(audioDirectory, PlaylistArtworkFileName.forCustomCover(playlistId, coverId))
+                        .apply { writeBytes(input.use { it.readBytes() }) }
+                        .canonicalPath
+                }
+            },
+        ) { playableTrackImporter(it) }
+
+        try {
+            val playlist = repositoryFixture.repository.addPlaylist("Delete despite sync failure").playlists.single()
+            val withArtwork = repositoryFixture.repository.setPlaylistArtwork(
+                playlist.id,
+                ByteArrayInputStream(byteArrayOf(61, 62, 63)),
+            ).playlists.single()
+            val artwork = File(requireNotNull(withArtwork.artworkPath))
+            failNextDirectorySync.set(true)
+
+            val removed = repositoryFixture.repository.removePlaylist(playlist.id)
+
+            assertTrue("The injected cleanup sync failure must happen after the state commit.", syncFailureObserved.get())
+            assertTrue(removed.playlists.none { it.id == playlist.id })
+            assertTrue(repositoryFixture.repository.load().playlists.none { it.id == playlist.id })
+            assertFalse("The owned cover unlink precedes the failed directory sync.", artwork.exists())
+        } finally {
+            repositoryFixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun failedPlaylistArtworkUnlinkRetriesOnNextLoad() {
+        val coverId = "f23e4567-e89b-12d3-a456-426614174000"
+        val repositoryFixture = repositoryFixture(
+            playlistArtworkImporterFactory = { audioDirectory ->
+                PlaylistArtworkImporter { playlistId, input ->
+                    audioDirectory.mkdirs()
+                    File(audioDirectory, PlaylistArtworkFileName.forCustomCover(playlistId, coverId))
+                        .apply { writeBytes(input.use { it.readBytes() }) }
+                        .canonicalPath
+                }
+            },
+        ) { playableTrackImporter(it) }
+
+        try {
+            val playlist = repositoryFixture.repository.addPlaylist("Retry orphan cleanup").playlists.single()
+            val artwork = File(
+                requireNotNull(
+                    repositoryFixture.repository.setPlaylistArtwork(
+                        playlist.id,
+                        ByteArrayInputStream(byteArrayOf(111, 112, 113)),
+                    ).playlists.single().artworkPath,
+                ),
+            )
+            repositoryFixture.repository.load()
+            val permissions = Files.getPosixFilePermissions(repositoryFixture.audioDirectory.toPath())
+
+            val removed = try {
+                Files.setPosixFilePermissions(
+                    repositoryFixture.audioDirectory.toPath(),
+                    setOf(
+                        java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+                        java.nio.file.attribute.PosixFilePermission.OWNER_EXECUTE,
+                    ),
+                )
+                repositoryFixture.repository.removePlaylist(playlist.id)
+            } finally {
+                Files.setPosixFilePermissions(repositoryFixture.audioDirectory.toPath(), permissions)
+            }
+
+            assertTrue(removed.playlists.none { it.id == playlist.id })
+            assertTrue("The denied unlink should leave the old cover for a later cleanup attempt.", artwork.isFile)
+            assertTrue(repositoryFixture.repository.load().playlists.none { it.id == playlist.id })
+            assertFalse("The same repository should reclaim the cover on its next load.", artwork.exists())
+        } finally {
+            repositoryFixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun globalTrackReorderSurvivesReloadWithoutChangingPlaylistOrder() {
+        val repositoryFixture = repositoryFixture { playableTrackImporter(it) }
+
+        try {
+            val first = repositoryFixture.repository.import(TestUri(TEST_URI))
+            val second = repositoryFixture.repository.import(TestUri(TEST_URI))
+            val third = repositoryFixture.repository.import(TestUri(TEST_URI))
+            val playlist = repositoryFixture.repository.addPlaylist("Stable collection order").playlists.single()
+            repositoryFixture.repository.addToPlaylist(playlist.id, first.id)
+            repositoryFixture.repository.addToPlaylist(playlist.id, third.id)
+            val playlistOrder = repositoryFixture.repository.load().playlists.single().trackIds
+
+            val reordered = repositoryFixture.repository.moveTrackInLibrary(third.id, 0)
+            val reloaded = repositoryFixture.newRepository().load()
+
+            assertEquals(listOf(third.id, first.id, second.id), reordered.tracks.map(Track::id))
+            assertEquals(reordered.tracks.map(Track::id), reloaded.tracks.map(Track::id))
+            assertEquals(playlistOrder, reordered.playlists.single().trackIds)
+            assertEquals(playlistOrder, reloaded.playlists.single().trackIds)
+        } finally {
+            repositoryFixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun importFailsWhenDocumentProviderCannotOpenSource() {
         val repositoryFixture = repositoryFixture(
             documentSource = AudioDocumentSource {
@@ -1119,6 +1633,54 @@ class LocalLibraryRepositoryImportTest {
     }
 
     @Test
+    fun startupSweepDeletesOnlyUnreferencedPlaylistArtwork() {
+        val activeCoverId = "b23e4567-e89b-12d3-a456-426614174000"
+        val orphanCoverId = "c23e4567-e89b-12d3-a456-426614174000"
+        val repositoryFixture = repositoryFixture(
+            playlistArtworkImporterFactory = { audioDirectory ->
+                PlaylistArtworkImporter { playlistId, input ->
+                    audioDirectory.mkdirs()
+                    File(audioDirectory, PlaylistArtworkFileName.forCustomCover(playlistId, activeCoverId))
+                        .apply { writeBytes(input.use { it.readBytes() }) }
+                        .canonicalPath
+                }
+            },
+        ) { playableTrackImporter(it) }
+
+        try {
+            val playlist = repositoryFixture.repository.addPlaylist("Keep this cover").playlists.single()
+            val activeArtwork = File(
+                requireNotNull(
+                    repositoryFixture.repository.setPlaylistArtwork(
+                        playlist.id,
+                        ByteArrayInputStream(byteArrayOf(71, 72, 73)),
+                    ).playlists.single().artworkPath,
+                ),
+            )
+            val orphanArtwork = File(
+                repositoryFixture.audioDirectory,
+                PlaylistArtworkFileName.forCustomCover("deleted-playlist", orphanCoverId),
+            ).apply { writeBytes(byteArrayOf(81, 82, 83)) }
+            val unrelatedTrackArtwork = File(
+                repositoryFixture.audioDirectory,
+                TrackArtworkFileName.forCustomCover("orphan-track", "d23e4567-e89b-12d3-a456-426614174000"),
+            ).apply { writeBytes(byteArrayOf(91, 92, 93)) }
+            val unrelatedAudio = File(repositoryFixture.audioDirectory, "e23e4567-e89b-12d3-a456-426614174000.mp3")
+                .apply { writeBytes(byteArrayOf(101, 102, 103)) }
+
+            val loaded = repositoryFixture.newRepository().load()
+
+            assertEquals(listOf(playlist.id), loaded.playlists.map { it.id })
+            assertTrue("An active playlist cover remains referenced and must survive.", activeArtwork.isFile)
+            assertFalse("Only the unreferenced generated playlist cover is reclaimed.", orphanArtwork.exists())
+            assertTrue("Track artwork remains outside this playlist-only sweep.", unrelatedTrackArtwork.isFile)
+            assertTrue("Loose audio remains outside this playlist-only sweep.", unrelatedAudio.isFile)
+        } finally {
+            repositoryFixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun coldLoadFromAnotherRepositoryWaitsForActiveImportBeforeSweeping() {
         val stagingCreated = CountDownLatch(1)
         val finishMetadataRead = CountDownLatch(1)
@@ -1265,6 +1827,29 @@ class LocalLibraryRepositoryImportTest {
             assertEquals(1, state.playlists.size)
             assertEquals("Keep this playlist", state.playlists.single().name)
             assertEquals(1, state.tracks.size)
+        } finally {
+            repositoryFixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun movedPlaylistTrackOrderSurvivesRepositoryReload() {
+        val repositoryFixture = repositoryFixture { audioDirectory ->
+            LocalAudioImporter(audioDirectory, AudioMetadataReader { AudioMetadata() }, { Long.MAX_VALUE })
+        }
+
+        try {
+            val firstTrack = repositoryFixture.repository.import(TestUri(TEST_URI))
+            val secondTrack = repositoryFixture.repository.import(TestUri(TEST_URI))
+            val playlist = repositoryFixture.repository.addPlaylist("Ordered collection").playlists.single()
+            repositoryFixture.repository.addToPlaylist(playlist.id, firstTrack.id)
+            repositoryFixture.repository.addToPlaylist(playlist.id, secondTrack.id)
+            repositoryFixture.repository.moveTrackInPlaylist(playlist.id, secondTrack.id, 0)
+
+            val reloaded = repositoryFixture.newRepository().load()
+
+            assertEquals(listOf(firstTrack.id, secondTrack.id), reloaded.tracks.map { it.id })
+            assertEquals(listOf(secondTrack.id, firstTrack.id), reloaded.playlists.single().trackIds)
         } finally {
             repositoryFixture.root.deleteRecursively()
         }
@@ -1720,6 +2305,7 @@ class LocalLibraryRepositoryImportTest {
         availableBytes: () -> Long = { Long.MAX_VALUE },
         documentSource: AudioDocumentSource? = null,
         artworkImporterFactory: ((File) -> TrackArtworkImporter)? = null,
+        playlistArtworkImporterFactory: ((File) -> PlaylistArtworkImporter)? = null,
         durability: AudioImportDurability = AndroidAudioImportDurability,
         importerFactory: (File) -> AudioTrackImporter,
     ): RepositoryFixture {
@@ -1745,6 +2331,7 @@ class LocalLibraryRepositoryImportTest {
                 availableBytes,
                 artworkImporterFactory?.invoke(audioDirectory) ?: LocalArtworkImporter(audioDirectory),
                 durability,
+                playlistArtworkImporterFactory?.invoke(audioDirectory) ?: LocalArtworkImporter(audioDirectory),
             )
         }
         return RepositoryFixture(
@@ -1771,6 +2358,14 @@ class LocalLibraryRepositoryImportTest {
     private fun mp3Fixture(): ByteArray = LocalLibraryRepositoryImportTest::class.java
         .getResourceAsStream("/mp3-fixtures/tone-01.mp3")!!
         .use { it.readBytes() }
+
+    private fun playableTrackImporter(audioDirectory: File): AudioTrackImporter = AudioTrackImporter { input, _, _ ->
+        input.close()
+        val trackId = UUID.randomUUID().toString()
+        val audio = File(audioDirectory, TrackFileName.forImport(trackId, "tone-01.mp3", "audio/mpeg")!!)
+            .apply { writeBytes(mp3Fixture()) }
+        Track(trackId, "Stable test track", "Test artist", durationMs = 1_000L, filePath = audio.canonicalPath)
+    }
 
     private data class RepositoryFixture(
         val root: File,

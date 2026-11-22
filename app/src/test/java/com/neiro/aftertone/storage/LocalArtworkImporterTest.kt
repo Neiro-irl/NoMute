@@ -1,6 +1,7 @@
 package com.neiro.aftertone.storage
 
 import com.neiro.aftertone.model.PrivateAudioPath
+import com.neiro.aftertone.model.PlaylistArtworkFileName
 import com.neiro.aftertone.model.TrackArtworkFileName
 import java.io.ByteArrayInputStream
 import java.io.File
@@ -149,6 +150,62 @@ class LocalArtworkImporterTest {
 
             assertFalse(processorCalled.get())
             assertTrue(audioDirectory.listFiles()!!.isEmpty())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun publishesProcessedPlaylistArtworkInAPlaylistOwnedNamespace() {
+        val root = Files.createTempDirectory("aftertone-playlist-artwork-").toFile()
+        val audioDirectory = File(root, "audio")
+        val playlistId = "collection-7"
+        val sourceBytes = byteArrayOf(2, 4, 6)
+        val processedBytes = byteArrayOf(8, 10, 12)
+        try {
+            val importer = LocalArtworkImporter(
+                audioDirectory,
+                ArtworkImageProcessor { source, output ->
+                    assertArrayEquals(sourceBytes, source.readBytes())
+                    output.writeBytes(processedBytes)
+                },
+                ArtworkDirectorySynchronizer { },
+            )
+
+            val path = importer.importPlaylistArtwork(playlistId, ByteArrayInputStream(sourceBytes))
+            val stored = File(path)
+
+            assertTrue(PrivateAudioPath.isDirectChild(audioDirectory, stored))
+            assertTrue(PlaylistArtworkFileName.isGeneratedFileName(playlistId, stored.name))
+            assertFalse(TrackArtworkFileName.isGeneratedFileName(playlistId, stored.name))
+            assertArrayEquals(processedBytes, stored.readBytes())
+            assertEquals(listOf(stored.name), audioDirectory.listFiles()!!.map(File::getName))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun playlistArtworkProcessorFailureCleansStagingFilesWithoutChangingOtherArtwork() {
+        val root = Files.createTempDirectory("aftertone-playlist-artwork-failure-").toFile()
+        val audioDirectory = File(root, "audio").apply { mkdirs() }
+        val trackId = "123e4567-e89b-12d3-a456-426614174000"
+        val otherArtwork = File(audioDirectory, TrackArtworkFileName.forCustomCover(trackId))
+            .apply { writeBytes(byteArrayOf(41, 42, 43)) }
+        try {
+            val importer = LocalArtworkImporter(
+                audioDirectory,
+                ArtworkImageProcessor { _, _ -> throw IOException("private decoder detail") },
+                ArtworkDirectorySynchronizer { },
+            )
+
+            assertThrows(IOException::class.java) {
+                importer.importPlaylistArtwork(trackId, ByteArrayInputStream(byteArrayOf(7, 8, 9)))
+            }
+
+            assertTrue(otherArtwork.isFile)
+            assertArrayEquals(byteArrayOf(41, 42, 43), otherArtwork.readBytes())
+            assertEquals(listOf(otherArtwork.name), audioDirectory.listFiles()!!.map(File::getName))
         } finally {
             root.deleteRecursively()
         }

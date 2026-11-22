@@ -61,6 +61,7 @@ data class Playlist(
     val id: String,
     val name: String,
     val trackIds: List<String> = emptyList(),
+    val artworkPath: String? = null,
 ) {
     fun withTrack(trackId: String): Playlist {
         val normalizedId = trackId.trim()
@@ -69,6 +70,20 @@ data class Playlist(
     }
 
     fun withoutTrack(trackId: String): Playlist = copy(trackIds = trackIds.filterNot { it == trackId })
+
+    fun moveTrack(trackId: String, destinationIndex: Int): Playlist {
+        val sourceIndex = trackIds.indexOf(trackId)
+        if (sourceIndex < 0 || destinationIndex !in trackIds.indices || sourceIndex == destinationIndex) return this
+
+        val reorderedTrackIds = trackIds.toMutableList()
+        reorderedTrackIds.add(destinationIndex, reorderedTrackIds.removeAt(sourceIndex))
+        return copy(trackIds = reorderedTrackIds)
+    }
+
+    fun tracksInOrder(availableTracks: List<Track>): List<Track> {
+        val tracksById = availableTracks.associateBy(Track::id)
+        return trackIds.mapNotNull(tracksById::get)
+    }
 }
 
 data class LibrarySnapshot(
@@ -80,6 +95,15 @@ data class LibrarySnapshot(
         if (tracks.none { it.id == trackId }) return this
         val favorites = if (trackId in favoriteTrackIds) favoriteTrackIds - trackId else favoriteTrackIds + trackId
         return copy(favoriteTrackIds = favorites)
+    }
+
+    fun moveTrack(trackId: String, destinationIndex: Int): LibrarySnapshot {
+        val sourceIndex = tracks.indexOfFirst { it.id == trackId }
+        if (sourceIndex < 0 || destinationIndex !in tracks.indices || sourceIndex == destinationIndex) return this
+
+        val reorderedTracks = tracks.toMutableList()
+        reorderedTracks.add(destinationIndex, reorderedTracks.removeAt(sourceIndex))
+        return copy(tracks = reorderedTracks)
     }
 
     fun removeTrack(trackId: String): LibrarySnapshot = copy(
@@ -142,6 +166,31 @@ object TrackArtworkFileName {
 
     private fun isCanonicalCoverId(value: String): Boolean = coverIdPattern.matches(value) &&
         runCatching { java.util.UUID.fromString(value).toString() == value }.getOrDefault(false)
+}
+
+object PlaylistArtworkFileName {
+    private val coverIdPattern = Regex("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+    private val generatedFileNamePattern = Regex(
+        "([A-Za-z0-9_-]{1,80})-playlist-artwork-($coverIdPattern)\\.img",
+    )
+
+    fun forCustomCover(playlistId: String, coverId: String = java.util.UUID.randomUUID().toString()): String {
+        require(isSafePlaylistId(playlistId)) { "The playlist ID is not a safe file name." }
+        require(isCanonicalCoverId(coverId)) { "The cover ID is not a canonical UUID." }
+        return "$playlistId-playlist-artwork-$coverId.img"
+    }
+
+    fun isGeneratedFileName(playlistId: String, fileName: String): Boolean =
+        isSafePlaylistId(playlistId) &&
+            generatedFileNamePattern.matchEntire(fileName)?.groupValues?.getOrNull(1) == playlistId
+
+    fun playlistIdFromGeneratedFileName(fileName: String): String? =
+        generatedFileNamePattern.matchEntire(fileName)?.groupValues?.getOrNull(1)
+
+    fun isSafePlaylistId(playlistId: String): Boolean = safeFileId.matches(playlistId)
+
+    fun isCanonicalCoverId(coverId: String): Boolean = coverIdPattern.matches(coverId) &&
+        runCatching { java.util.UUID.fromString(coverId).toString() == coverId }.getOrDefault(false)
 }
 
 object TrackFileName {

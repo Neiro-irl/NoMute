@@ -3,6 +3,7 @@ package com.neiro.aftertone.storage
 import com.neiro.aftertone.model.LibrarySnapshot
 import com.neiro.aftertone.model.LibraryStateCodec
 import com.neiro.aftertone.model.Playlist
+import com.neiro.aftertone.model.PlaylistArtworkFileName
 import com.neiro.aftertone.model.Track
 import com.neiro.aftertone.model.TrackFileName
 import java.io.ByteArrayInputStream
@@ -28,7 +29,8 @@ internal data class PortableLibraryBackupManifest(
 
 internal object LibraryBackupManifestCodec {
     private val magic = byteArrayOf(0x41, 0x46, 0x54, 0x52, 0x42, 0x4b, 0x55, 0x50) // AFTRBKUP
-    private const val VERSION = 1
+    private const val MIN_SUPPORTED_VERSION = 1
+    private const val VERSION = 2
     private const val MAX_TRACKS = 20_000
     private const val MAX_PLAYLISTS = 2_000
     private const val MAX_PLAYLIST_TRACKS = 20_000
@@ -47,9 +49,9 @@ internal object LibraryBackupManifestCodec {
         val stateBytes = LibraryStateCodec.encodeUtf8Strict(encodedState)
         require(stateBytes.size <= LibraryStateCodec.MAX_STATE_UTF8_BYTES) { "The backup library state exceeds the supported size." }
         val snapshot = LibraryStateCodec.decode(encodedState)
-        validateState(snapshot)
+        validateState(snapshot, VERSION)
         requireStrictPropertyKeys(encodedState, snapshot)
-        validateAssets(snapshot, assets, limits)
+        validateAssets(snapshot, assets, limits, VERSION)
         require(assets.size + 1 <= limits.maxEntries) { "The backup contains too many files." }
 
         val manifest = ByteArrayOutputStream()
@@ -83,7 +85,8 @@ internal object LibraryBackupManifestCodec {
         try {
             input.readFully(header)
             require(header.contentEquals(magic)) { "This is not a NoMute backup archive." }
-            require(input.readInt() == VERSION) { "This backup version is not supported." }
+            val version = input.readInt()
+            require(version in MIN_SUPPORTED_VERSION..VERSION) { "This backup version is not supported." }
             val stateLength = input.readInt()
             require(stateLength in 1..LibraryStateCodec.MAX_STATE_UTF8_BYTES && stateLength <= input.available()) {
                 "The backup library state is incomplete or too large."
@@ -100,7 +103,7 @@ internal object LibraryBackupManifestCodec {
             require(encodedState.length <= LibraryStateCodec.MAX_STATE_CHARS) { "The backup library state exceeds the supported size." }
             checkCancelled()
             val snapshot = LibraryStateCodec.decode(encodedState, checkCancelled)
-            validateState(snapshot, checkCancelled)
+            validateState(snapshot, version, checkCancelled)
             requireStrictPropertyKeys(encodedState, snapshot, checkCancelled)
 
             val assetCount = input.readInt()
@@ -113,7 +116,7 @@ internal object LibraryBackupManifestCodec {
                 assets += LibraryBackupAsset(name, size)
             }
             require(input.available() == 0) { "The backup manifest contains unexpected trailing data." }
-            validateAssets(snapshot, assets, limits, checkCancelled)
+            validateAssets(snapshot, assets, limits, version, checkCancelled)
             var total = 0L
             assets.forEach { asset ->
                 checkCancelled()
@@ -137,7 +140,11 @@ internal object LibraryBackupManifestCodec {
         }
     }
 
-    private fun validateState(snapshot: LibrarySnapshot, checkCancelled: () -> Unit = {}) {
+    private fun validateState(
+        snapshot: LibrarySnapshot,
+        manifestVersion: Int = VERSION,
+        checkCancelled: () -> Unit = {},
+    ) {
         checkCancelled()
         require(snapshot.tracks.size <= MAX_TRACKS) { "The backup contains too many tracks." }
         require(snapshot.playlists.size <= MAX_PLAYLISTS) { "The backup contains too many playlists." }
@@ -182,6 +189,11 @@ internal object LibraryBackupManifestCodec {
                     "The backup playlist contains duplicate or missing track references."
                 }
             }
+            playlist.artworkPath?.let { artworkPath ->
+                require(manifestVersion >= 2 && artworkPath == "playlist-artwork/${playlist.id}.img") {
+                    "The backup contains an invalid playlist artwork reference."
+                }
+            }
         }
     }
 
@@ -189,6 +201,7 @@ internal object LibraryBackupManifestCodec {
         snapshot: LibrarySnapshot,
         assets: List<LibraryBackupAsset>,
         limits: LibraryBackupLimits,
+        manifestVersion: Int = VERSION,
         checkCancelled: () -> Unit = {},
     ) {
         val expectedNames = hashSetOf<String>()
@@ -196,6 +209,10 @@ internal object LibraryBackupManifestCodec {
             checkCancelled()
             expectedNames += track.filePath
             track.artworkPath?.let(expectedNames::add)
+        }
+        snapshot.playlists.forEach { playlist ->
+            checkCancelled()
+            if (manifestVersion >= 2) playlist.artworkPath?.let(expectedNames::add)
         }
         require(assets.size == expectedNames.size) { "The backup file list does not match its library." }
         val assetNames = hashSetOf<String>()
@@ -293,6 +310,11 @@ internal object LibraryBackupManifestCodec {
             val base = runCatching { portableName(name, "artwork/") }.getOrNull() ?: return false
             val id = base.removeSuffix(".img")
             validId.matches(id) && base == "$id.img"
+        }
+        name.startsWith("playlist-artwork/") -> {
+            val base = runCatching { portableName(name, "playlist-artwork/") }.getOrNull() ?: return false
+            val id = base.removeSuffix(".img")
+            PlaylistArtworkFileName.isSafePlaylistId(id) && base == "$id.img"
         }
         else -> false
     }

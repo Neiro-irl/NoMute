@@ -54,6 +54,7 @@ fun CollectionsScreen(
     onOpenPlaylist: (Playlist) -> Unit,
     onCreatePlaylist: () -> Unit,
     onRequestDeletePlaylist: (Playlist) -> Unit,
+    onChoosePlaylistArtwork: (String) -> Unit,
 ) {
     val favoritePreview = library.tracks.firstOrNull { it.id in library.favoriteTrackIds }
 
@@ -100,14 +101,16 @@ fun CollectionsScreen(
             }
         } else {
             items(library.playlists, key = Playlist::id) { playlist ->
-                val firstTrackId = playlist.trackIds.firstOrNull()
-                val preview = firstTrackId?.let { id -> library.tracks.firstOrNull { it.id == id } }
+                val preview = playlist.tracksInOrder(library.tracks).firstOrNull()
                 CollectionCard(
                     title = playlist.name,
                     subtitle = formatTrackCount(playlist.trackIds.size),
                     preview = preview,
+                    artworkPath = playlist.artworkPath,
+                    artworkDescription = "Обложка подборки: ${playlist.name}",
                     icon = Icons.AutoMirrored.Filled.QueueMusic,
                     onClick = { onOpenPlaylist(playlist) },
+                    onChooseArtwork = { onChoosePlaylistArtwork(playlist.id) },
                     onDelete = { onRequestDeletePlaylist(playlist) },
                 )
             }
@@ -122,6 +125,9 @@ private fun CollectionCard(
     preview: Track?,
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     onClick: () -> Unit,
+    artworkPath: String? = null,
+    artworkDescription: String? = null,
+    onChooseArtwork: (() -> Unit)? = null,
     onDelete: (() -> Unit)? = null,
 ) {
     var menuExpanded by remember(title) { mutableStateOf(false) }
@@ -135,8 +141,15 @@ private fun CollectionCard(
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 14.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            if (preview != null) {
-                TrackArtwork(preview, Modifier.size(64.dp), cornerRadius = 15)
+            if (preview != null || artworkPath != null) {
+                TrackArtwork(
+                    track = preview,
+                    modifier = Modifier.size(64.dp),
+                    cornerRadius = 15,
+                    artworkPathOverride = artworkPath,
+                    artworkDescription = artworkDescription,
+                    fallbackLabel = title,
+                )
             } else {
                 Surface(shape = RoundedCornerShape(15.dp), color = AftertoneSurfaceHigh, modifier = Modifier.size(64.dp)) {
                     Icon(icon, contentDescription = null, tint = AftertoneAccent, modifier = Modifier.padding(19.dp))
@@ -146,7 +159,7 @@ private fun CollectionCard(
                 Text(title, color = AftertoneText, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Text(subtitle, color = AftertoneMuted, fontSize = 12.sp)
             }
-            if (onDelete != null) {
+            if (onDelete != null || onChooseArtwork != null) {
                 Box {
                     IconButton(
                         onClick = { menuExpanded = true },
@@ -155,10 +168,18 @@ private fun CollectionCard(
                         Icon(Icons.Filled.MoreVert, contentDescription = null, tint = AftertoneMuted)
                     }
                     DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
-                        DropdownMenuItem(
-                            text = { Text("Удалить подборку", color = androidx.compose.material3.MaterialTheme.colorScheme.error) },
-                            onClick = { menuExpanded = false; onDelete() },
-                        )
+                        if (onChooseArtwork != null) {
+                            DropdownMenuItem(
+                                text = { Text(if (artworkPath == null) "Выбрать обложку" else "Изменить обложку") },
+                                onClick = { menuExpanded = false; onChooseArtwork() },
+                            )
+                        }
+                        if (onDelete != null) {
+                            DropdownMenuItem(
+                                text = { Text("Удалить подборку", color = androidx.compose.material3.MaterialTheme.colorScheme.error) },
+                                onClick = { menuExpanded = false; onDelete() },
+                            )
+                        }
                     }
                 }
             }

@@ -47,6 +47,18 @@ import com.neiro.aftertone.ui.theme.AftertoneSurfaceHigh
 
 internal fun miniPlayerTitle(track: Track?): String = track?.displayTitle ?: "Пока ничего не играет"
 
+internal fun miniPlayerPlaybackState(isPlaying: Boolean): String =
+    if (isPlaying) "Воспроизводится" else "На паузе"
+
+internal fun miniPlayerProgress(currentPositionMs: Long, durationMs: Long, trackDurationMs: Long): Float {
+    val effectiveDuration = durationMs.takeIf { it > 0 } ?: trackDurationMs
+    return if (effectiveDuration > 0) {
+        (currentPositionMs.toFloat() / effectiveDuration).coerceIn(0f, 1f)
+    } else {
+        0f
+    }
+}
+
 @Composable
 fun MiniPlayer(
     track: Track?,
@@ -88,12 +100,7 @@ fun MiniPlayer(
                 }
             }
         } else {
-            val effectiveDuration = durationMs.takeIf { it > 0 } ?: visibleTrack.durationMs
-            val progress = if (effectiveDuration > 0) {
-                (currentPositionMs.toFloat() / effectiveDuration).coerceIn(0f, 1f)
-            } else {
-                0f
-            }
+            val progress = miniPlayerProgress(currentPositionMs, durationMs, visibleTrack.durationMs)
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -108,6 +115,7 @@ fun MiniPlayer(
                     Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                         Text(miniPlayerTitle(visibleTrack), color = MaterialTheme.colorScheme.onSurface, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         Text(visibleTrack.displayArtist, color = AftertoneMuted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(miniPlayerPlaybackState(isPlaying), color = AftertoneMuted, fontSize = 11.sp, maxLines = 1)
                     }
                     IconButton(
                         onClick = onPlayPause,

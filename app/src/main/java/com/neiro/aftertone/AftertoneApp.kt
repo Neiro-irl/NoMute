@@ -2,6 +2,7 @@ package com.neiro.aftertone
 
 import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.os.Bundle
 import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -41,6 +42,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -57,6 +59,11 @@ import com.neiro.aftertone.model.LibrarySnapshot
 import com.neiro.aftertone.model.Playlist
 import com.neiro.aftertone.model.Track
 import com.neiro.aftertone.playback.nextRepeatMode
+import com.neiro.aftertone.playback.LIBRARY_CONTINUATION_EXTRA_KEY
+import com.neiro.aftertone.playback.libraryContinuationTracks
+import com.neiro.aftertone.playback.playbackQueueRequest
+import com.neiro.aftertone.playback.readQueueSnapshot
+import com.neiro.aftertone.playback.requiresQueueEndReordering
 import com.neiro.aftertone.playback.rememberMediaController
 import com.neiro.aftertone.playback.rememberPlaybackUiState
 import com.neiro.aftertone.storage.BackupProgress
@@ -68,6 +75,7 @@ import com.neiro.aftertone.storage.RestoreFinalizationResult
 import com.neiro.aftertone.storage.launchRestoreOperation
 import com.neiro.aftertone.ui.components.AftertoneBottomBar
 import com.neiro.aftertone.ui.components.formatTrackCount
+import com.neiro.aftertone.ui.dialogs.BatchImportDialog
 import com.neiro.aftertone.ui.dialogs.ConfirmDeletePlaylistDialog
 import com.neiro.aftertone.ui.dialogs.ConfirmRemoveDialog
 import com.neiro.aftertone.ui.dialogs.CreatePlaylistDialog
@@ -99,6 +107,9 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlin.random.Random
 
 internal const val EXTERNAL_AUDIO_SUCCESS_NOTIFICATION_MESSAGE = "Трек добавлен в медиатеку и воспроизводится."
 
@@ -133,6 +144,8 @@ internal fun AftertoneApp(
     onExternalAudioRequestHandled: (String, Int) -> Unit = { _, _ -> },
     onExternalAudioRequestFailed: (String, Int, ExternalAudioOpenFailureKind, String) -> Unit = { _, _, _, _ -> },
     onExternalAudioRequestFailureChoice: (String, Int, ExternalAudioOpenFailureChoice) -> Unit = { _, _, _ -> },
+    onBatchImportUriClaimsChanged: (Set<Uri>) -> Unit,
+    onBatchImportUriNoLongerNeeded: (Uri) -> Unit,
 ) {
     val context = LocalContext.current
     val artworkSavedMessage = stringResource(R.string.track_artwork_saved)
@@ -141,6 +154,7 @@ internal fun AftertoneApp(
     val repository = remember(context.applicationContext) { LocalLibraryRepository.shared(context) }
     val restoreActionGate = repository.restoreActionGate
     val scope = rememberCoroutineScope()
+    val libraryOrderMutationMutex = remember { Mutex() }
     val snackbarHostState = remember { SnackbarHostState() }
     LaunchedEffect(Unit) {
         ExternalAudioOpenNotifications.deliverContinuously { message -> snackbarHostState.showSnackbar(message) }
@@ -153,8 +167,13 @@ internal fun AftertoneApp(
     var libraryLoadError by remember { mutableStateOf(false) }
     var libraryLoadAttempt by remember { mutableIntStateOf(0) }
     var isImporting by remember { mutableStateOf(false) }
+    var batchImportState by rememberSaveable(stateSaver = BatchImportStateSaver) {
+        mutableStateOf(BatchImportState())
+    }
+    var pickerUriGrantClaims by remember { mutableStateOf(BatchImportUriGrantClaims()) }
     var isSavingArtwork by remember { mutableStateOf(false) }
     var pendingArtworkTrackId by rememberSaveable { mutableStateOf<String?>(null) }
+    var pendingPlaylistArtworkId by rememberSaveable { mutableStateOf<String?>(null) }
     var activeTab by rememberSaveable { mutableStateOf(AppTab.HOME) }
     var openCollectionId by rememberSaveable { mutableStateOf<String?>(null) }
     var showNowPlaying by rememberSaveable { mutableStateOf(false) }
@@ -181,6 +200,44 @@ internal fun AftertoneApp(
     var pendingRestoreCleanupId by remember { mutableStateOf(restoreActionGate.pendingCleanupTransactionId) }
     var backupCancellationToken by remember { mutableStateOf<BackupCancellationToken?>(null) }
     val latestBackupCancellationToken by rememberUpdatedState(backupCancellationToken)
+    val batchImportCoordinator = remember(repository, restoreActionGate) {
+        BatchImportCoordinator(context.contentResolver, repository, restoreActionGate)
+    }
+    val batchImportWorkflowHost = object : BatchImportWorkflowHost {
+        override var batchState: BatchImportState
+            get() = batchImportState
+            set(value) { batchImportState = value }
+
+        override var pickerClaims: BatchImportUriGrantClaims
+            get() = pickerUriGrantClaims
+            set(value) { pickerUriGrantClaims = value }
+
+        override var importInProgress: Boolean
+            get() = isImporting
+            set(value) { isImporting = value }
+
+        override val unavailableMessage: String
+            get() = libraryActionUnavailableMessage
+
+        override fun canStartImport(): Boolean =
+            isLibraryLoaded && !libraryLoadError && !isBackupBusy && !isSavingArtwork && !restoreActionGate.isBlocked
+
+        override fun onReadGrantClaimsChanged(uris: Set<Uri>) = onBatchImportUriClaimsChanged(uris)
+
+        override fun onReadGrantNoLongerNeeded(uri: Uri) = onBatchImportUriNoLongerNeeded(uri)
+
+        override fun onLibraryReloaded(snapshot: LibrarySnapshot) {
+            library = snapshot
+        }
+
+        override fun showMessage(message: String) {
+            scope.launch { snackbarHostState.showSnackbar(message) }
+        }
+    }
+    val allReadGrantClaims = remember(batchImportState.activeReadGrantUris, pickerUriGrantClaims) {
+        batchImportCoordinator.allReadGrantClaims(batchImportState, pickerUriGrantClaims)
+    }
+    SideEffect { onBatchImportUriClaimsChanged(allReadGrantClaims) }
 
     DisposableEffect(repository) {
         onDispose {
@@ -230,43 +287,24 @@ internal fun AftertoneApp(
     }
 
     val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris: List<Uri> ->
-        if (uris.isNotEmpty()) scope.launch {
-            val counts = restoreActionGate.withLibraryAction {
-                isImporting = true
-                try {
-                    val importedTrackIds = linkedSetOf<String>()
-                    var failedCount = 0
-                    uris.forEach { uri ->
-                        if (restoreActionGate.isBlocked) return@forEach
-                        val result = runCatching { withContext(Dispatchers.IO) { repository.import(uri) } }
-                        result.onSuccess { importedTrackIds += it.id }.onFailure { failedCount++ }
-                    }
-                    library = withContext(Dispatchers.IO) { repository.load() }
-                    val reloadedTrackIds = library.tracks.mapTo(hashSetOf()) { it.id }
-                    val counts = reconcileImportedTrackIds(importedTrackIds, failedCount, reloadedTrackIds)
-                    counts.importedCount to counts.failedCount
-                } finally {
-                    isImporting = false
-                }
-            } ?: return@launch
-            val (importedCount, failedCount) = counts
-            val message = when {
-                failedCount == 0 && importedCount == 1 -> "Добавлен 1 трек на этот телефон."
-                failedCount == 0 -> "Скопировано ${formatTrackCount(importedCount)} на этот телефон."
-                importedCount == 0 -> "Не удалось импортировать эти файлы. Выбери поддерживаемые аудиофайлы и попробуй снова."
-                else -> "Импортировано ${formatTrackCount(importedCount)}; не удалось прочитать ${formatTrackCount(failedCount)}."
-            }
-            snackbarHostState.showSnackbar(message)
-        }
+        scope.launch { batchImportCoordinator.importSelectedUris(batchImportWorkflowHost, uris) }
     }
 
     val artworkPickerLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         val trackId = pendingArtworkTrackId
+        val playlistId = pendingPlaylistArtworkId
         pendingArtworkTrackId = null
-        if (uri != null && trackId != null) scope.launch {
+        pendingPlaylistArtworkId = null
+        if (uri != null && (trackId != null || playlistId != null)) scope.launch {
             val result = restoreActionGate.withLibraryAction {
-                if (!isLibraryLoaded || libraryLoadError || isImporting || isSavingArtwork || isBackupBusy ||
-                    pendingRestoreCleanupId != null || restoreActionGate.isBlocked
+                val hasSingleTarget = (trackId != null) != (playlistId != null)
+                val targetAvailable = when {
+                    trackId != null -> library.tracks.any { it.id == trackId }
+                    playlistId != null -> library.playlists.any { it.id == playlistId }
+                    else -> false
+                }
+                if (!hasSingleTarget || !targetAvailable || !isLibraryLoaded || libraryLoadError || isImporting ||
+                    isSavingArtwork || isBackupBusy || pendingRestoreCleanupId != null || restoreActionGate.isBlocked
                 ) {
                     ArtworkUpdateResult.UNAVAILABLE
                 } else {
@@ -275,7 +313,10 @@ internal fun AftertoneApp(
                         val updatedLibrary = withContext(Dispatchers.IO) {
                             val input = context.contentResolver.openInputStream(uri)
                                 ?: throw IOException("Could not open the selected image.")
-                            input.use { repository.setTrackArtwork(trackId, it) }
+                            input.use {
+                                if (playlistId != null) repository.setPlaylistArtwork(playlistId, it)
+                                else repository.setTrackArtwork(requireNotNull(trackId), it)
+                            }
                         }
                         library = updatedLibrary
                         ArtworkUpdateResult.SAVED
@@ -289,8 +330,8 @@ internal fun AftertoneApp(
                 }
             }
             val message = when (result) {
-                ArtworkUpdateResult.SAVED -> artworkSavedMessage
-                ArtworkUpdateResult.FAILED -> artworkSaveFailedMessage
+                ArtworkUpdateResult.SAVED -> if (playlistId != null) "Обложка подборки сохранена." else artworkSavedMessage
+                ArtworkUpdateResult.FAILED -> if (playlistId != null) "Не удалось сохранить обложку подборки." else artworkSaveFailedMessage
                 ArtworkUpdateResult.UNAVAILABLE, null -> libraryActionUnavailableMessage
             }
             snackbarHostState.showSnackbar(message)
@@ -298,7 +339,7 @@ internal fun AftertoneApp(
     }
 
     fun launchChooseArtwork(trackId: String) {
-        if (pendingArtworkTrackId != null) return
+        if (pendingArtworkTrackId != null || pendingPlaylistArtworkId != null) return
         if (!isLibraryLoaded || libraryLoadError || isImporting || isSavingArtwork || isBackupBusy ||
             pendingRestoreCleanupId != null || restoreActionGate.isBlocked || library.tracks.none { it.id == trackId }
         ) {
@@ -306,6 +347,18 @@ internal fun AftertoneApp(
             return
         }
         pendingArtworkTrackId = trackId
+        artworkPickerLauncher.launch("image/*")
+    }
+
+    fun launchChoosePlaylistArtwork(playlistId: String) {
+        if (pendingArtworkTrackId != null || pendingPlaylistArtworkId != null) return
+        if (!isLibraryLoaded || libraryLoadError || isImporting || isSavingArtwork || isBackupBusy ||
+            pendingRestoreCleanupId != null || restoreActionGate.isBlocked || library.playlists.none { it.id == playlistId }
+        ) {
+            scope.launch { snackbarHostState.showSnackbar(libraryActionUnavailableMessage) }
+            return
+        }
+        pendingPlaylistArtworkId = playlistId
         artworkPickerLauncher.launch("image/*")
     }
 
@@ -719,6 +772,25 @@ internal fun AftertoneApp(
         }
     }
 
+    fun mediaItemForTrack(track: Track, isLibraryContinuation: Boolean = false): MediaItem {
+        val metadataBuilder = MediaMetadata.Builder()
+            .setTitle(track.displayTitle)
+            .setArtist(track.displayArtist)
+            .setAlbumTitle(track.album)
+            .setArtworkUri(track.artworkPath?.toUri())
+        if (isLibraryContinuation) {
+            metadataBuilder.setExtras(Bundle().apply {
+                putBoolean(LIBRARY_CONTINUATION_EXTRA_KEY, true)
+            })
+        }
+        val metadata = metadataBuilder.build()
+        return MediaItem.Builder()
+            .setMediaId(track.id)
+            .setUri(File(track.filePath).toUri())
+            .setMediaMetadata(metadata)
+            .build()
+    }
+
     fun playTracks(
         tracks: List<Track>,
         selectedTrackId: String,
@@ -731,21 +803,15 @@ internal fun AftertoneApp(
                 scope.launch { snackbarHostState.showSnackbar("Проигрыватель подключается. Попробуй ещё раз через секунду.") }
                 return
             }
-            val items = tracks.map { track ->
-                val metadata = MediaMetadata.Builder()
-                    .setTitle(track.displayTitle)
-                    .setArtist(track.displayArtist)
-                    .setAlbumTitle(track.album)
-                    .setArtworkUri(track.artworkPath?.toUri())
-                    .build()
-                MediaItem.Builder()
-                    .setMediaId(track.id)
-                    .setUri(File(track.filePath).toUri())
-                    .setMediaMetadata(metadata)
-                    .build()
+            val queueRequest = playbackQueueRequest(tracks, selectedTrackId)
+            val continuationTracks = library.tracks.takeIf { it.isNotEmpty() }?.let { libraryTracks ->
+                libraryContinuationTracks(libraryTracks, Random.nextInt(libraryTracks.size))
+            }.orEmpty()
+            val items = buildList {
+                addAll(queueRequest.tracks.map { mediaItemForTrack(it) })
+                addAll(continuationTracks.map { mediaItemForTrack(it, isLibraryContinuation = true) })
             }
-            val startIndex = tracks.indexOfFirst { it.id == selectedTrackId }.coerceAtLeast(0)
-            player.setMediaItems(items, startIndex, C.TIME_UNSET)
+            player.setMediaItems(items, queueRequest.startIndex, C.TIME_UNSET)
             player.prepare()
             player.play()
             showNowPlaying = true
@@ -757,6 +823,41 @@ internal fun AftertoneApp(
             restoreActionGate.runIfAllowed(dispatchPermit, ::enqueuePlayback)
         }
         return actionAllowed && startedPlayback
+    }
+
+    fun playLibraryTrack(selectedTrackId: String) {
+        playTracks(library.tracks, selectedTrackId)
+    }
+
+    fun addTrackToQueue(track: Track) {
+        var addedToQueue = false
+        val actionAllowed = restoreActionGate.runIfAllowed {
+            val activeController = controller
+            if (activeController != null && activeController.isCommandAvailable(Player.COMMAND_CHANGE_MEDIA_ITEMS)) {
+                val addedPlayerIndex = activeController.mediaItemCount
+                activeController.addMediaItem(mediaItemForTrack(track))
+                if (activeController.mediaItemCount > addedPlayerIndex) {
+                    val queueSnapshot = activeController.readQueueSnapshot()
+                    val queuePlan = queueSnapshot.planMoveUpcomingItemBeforeLibraryContinuation(addedPlayerIndex)
+                        ?: if (requiresQueueEndReordering(activeController.shuffleModeEnabled, activeController.repeatMode)) {
+                            queueSnapshot.planMoveToQueueEnd(addedPlayerIndex)
+                        } else {
+                            null
+                        }
+                    queuePlan?.moves?.forEach { move ->
+                        activeController.moveMediaItem(move.fromIndex, move.toIndex)
+                    }
+                }
+                addedToQueue = true
+            }
+        }
+        when {
+            addedToQueue -> scope.launch { snackbarHostState.showSnackbar("Добавлено в очередь: ${track.displayTitle}") }
+            !actionAllowed -> scope.launch { snackbarHostState.showSnackbar(libraryActionUnavailableMessage) }
+            else -> scope.launch {
+                snackbarHostState.showSnackbar("Проигрыватель подключается. Попробуй добавить трек ещё раз через секунду.")
+            }
+        }
     }
 
     LaunchedEffect(
@@ -999,6 +1100,48 @@ internal fun AftertoneApp(
         }
     }
 
+    fun moveTrackInPlaylist(playlistId: String, trackId: String, destinationIndex: Int) {
+        scope.launch {
+            runCatching {
+                restoreActionGate.withLibraryAction {
+                    withContext(Dispatchers.IO) {
+                        repository.moveTrackInPlaylist(playlistId, trackId, destinationIndex)
+                    }
+                }
+            }
+                .onSuccess { updated -> if (updated != null) library = updated }
+                .onFailure { snackbarHostState.showSnackbar("Не удалось изменить порядок треков.") }
+        }
+    }
+
+    fun moveTrackInLibrary(trackId: String, destinationIndex: Int) {
+        if (restoreActionGate.isBlocked) return
+        val previousLibrary = library
+        val optimisticLibrary = previousLibrary.moveTrack(trackId, destinationIndex)
+        if (optimisticLibrary === previousLibrary) return
+        library = optimisticLibrary
+        scope.launch {
+            try {
+                val updated = libraryOrderMutationMutex.withLock {
+                    restoreActionGate.withLibraryAction {
+                        withContext(Dispatchers.IO) {
+                            repository.moveTrackInLibrary(trackId, destinationIndex)
+                        }
+                    }
+                }
+                library = updated ?: withContext(Dispatchers.IO) { repository.load() }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                val restoredLibrary = withContext(Dispatchers.IO) {
+                    runCatching { repository.load() }.getOrNull()
+                }
+                if (restoredLibrary != null) library = restoredLibrary
+                snackbarHostState.showSnackbar("Не удалось сохранить порядок медиатеки.")
+            }
+        }
+    }
+
     fun addToCollection(trackId: String) {
         if (restoreActionGate.isBlocked) return
         trackToAddToPlaylist = trackId
@@ -1116,7 +1259,11 @@ internal fun AftertoneApp(
                             isPlaying = playback.isPlaying,
                             currentPositionMs = playback.currentPositionMs,
                             durationMs = playback.durationMs,
-                            queueSize = playback.queueSize,
+                            queue = playback.queue,
+                            canEditQueue = !restoreActionGate.isBlocked &&
+                                controller?.isCommandAvailable(Player.COMMAND_CHANGE_MEDIA_ITEMS) == true,
+                            canSelectQueueItems = !restoreActionGate.isBlocked &&
+                                controller?.isCommandAvailable(Player.COMMAND_SEEK_TO_MEDIA_ITEM) == true,
                             shuffleModeEnabled = playback.shuffleModeEnabled,
                             repeatMode = playback.repeatMode,
                             onBack = { showNowPlaying = false },
@@ -1148,18 +1295,58 @@ internal fun AftertoneApp(
                                     activeController.isCommandAvailable(Player.COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM) &&
                                     restoreActionGate.runIfAllowed { activeController.seekTo(position) }
                             },
+                            onSelectQueueItem = { mediaItemIndex ->
+                                restoreActionGate.runIfAllowed {
+                                    val activeController = controller
+                                    if (activeController != null &&
+                                        mediaItemIndex in 0 until activeController.mediaItemCount &&
+                                        activeController.isCommandAvailable(Player.COMMAND_SEEK_TO_MEDIA_ITEM)
+                                    ) {
+                                        activeController.seekToDefaultPosition(mediaItemIndex)
+                                        activeController.play()
+                                    }
+                                }
+                            },
+                            onMoveQueueItem = { fromIndex, toIndex ->
+                                restoreActionGate.runIfAllowed {
+                                    val activeController = controller
+                                    val plan = playback.queue.planMoveUpcomingItem(fromIndex, toIndex)
+                                    if (activeController != null && plan != null &&
+                                        activeController.isCommandAvailable(Player.COMMAND_CHANGE_MEDIA_ITEMS)
+                                    ) {
+                                        plan.moves.forEach { move ->
+                                            activeController.moveMediaItem(move.fromIndex, move.toIndex)
+                                        }
+                                    }
+                                }
+                            },
+                            onRemoveQueueItem = { index ->
+                                restoreActionGate.runIfAllowed {
+                                    val activeController = controller
+                                    val plan = playback.queue.planRemoveUpcomingItem(index)
+                                    if (activeController != null && plan != null &&
+                                        activeController.isCommandAvailable(Player.COMMAND_CHANGE_MEDIA_ITEMS)
+                                    ) {
+                                        activeController.removeMediaItem(plan.mediaItemIndex)
+                                    }
+                                }
+                            },
                         )
                         Page.COLLECTION -> CollectionDetailScreen(
                             library = library,
                             playlist = currentPlaylist,
                             favorites = screen.collectionId == FAVORITES_COLLECTION_ID,
                             onBack = { openCollectionId = null },
+                            onPlayTrack = ::playLibraryTrack,
                             onPlayTracks = ::playTracks,
+                            onAddToQueue = ::addTrackToQueue,
                             onToggleFavorite = ::toggleFavorite,
                             onAddToCollection = ::addToCollection,
                             onRemoveFromDevice = ::requestRemove,
                             onChooseArtwork = ::launchChooseArtwork,
+                            onChoosePlaylistArtwork = ::launchChoosePlaylistArtwork,
                             onRemoveFromPlaylist = ::removeFromPlaylist,
+                            onMoveTrack = ::moveTrackInPlaylist,
                         )
                         Page.TAB -> when (screen.tab) {
                             AppTab.HOME -> HomeScreen(
@@ -1168,7 +1355,8 @@ internal fun AftertoneApp(
                                 onImport = ::launchImport,
                                 onOpenLibrary = { activeTab = AppTab.LIBRARY; openCollectionId = null },
                                 onOpenCollections = { activeTab = AppTab.COLLECTIONS; openCollectionId = null },
-                                onPlayTracks = ::playTracks,
+                                onPlayTrack = ::playLibraryTrack,
+                                onAddToQueue = ::addTrackToQueue,
                                 onToggleFavorite = ::toggleFavorite,
                                 onAddToCollection = ::addToCollection,
                                 onRemoveFromDevice = ::requestRemove,
@@ -1178,17 +1366,20 @@ internal fun AftertoneApp(
                                 library = library,
                                 isImporting = isImporting,
                                 onImport = ::launchImport,
-                                onPlayTracks = ::playTracks,
+                                onPlayTrack = ::playLibraryTrack,
+                                onAddToQueue = ::addTrackToQueue,
                                 onToggleFavorite = ::toggleFavorite,
                                 onAddToCollection = ::addToCollection,
                                 onRemoveFromDevice = ::requestRemove,
                                 onChooseArtwork = ::launchChooseArtwork,
+                                onMoveTrackInLibrary = ::moveTrackInLibrary,
                             )
                             AppTab.SEARCH -> SearchScreen(
                                 library = library,
                                 isImporting = isImporting,
                                 onImport = ::launchImport,
-                                onPlayTracks = ::playTracks,
+                                onPlayTrack = ::playLibraryTrack,
+                                onAddToQueue = ::addTrackToQueue,
                                 onToggleFavorite = ::toggleFavorite,
                                 onAddToCollection = ::addToCollection,
                                 onRemoveFromDevice = ::requestRemove,
@@ -1205,6 +1396,7 @@ internal fun AftertoneApp(
                                     }
                                 },
                                 onRequestDeletePlaylist = { if (!restoreActionGate.isBlocked) playlistToDelete = it },
+                                onChoosePlaylistArtwork = ::launchChoosePlaylistArtwork,
                             )
                             AppTab.SETTINGS -> SettingsScreen(
                                 selectedPalette = selectedPalette,
@@ -1276,6 +1468,29 @@ internal fun AftertoneApp(
                     Text("Пропустить")
                 }
             },
+        )
+    }
+
+    if (batchImportState.items.isNotEmpty()) {
+        val batchImportSkipActions = BatchImportSkipActions(
+            currentState = { batchImportState },
+            updateState = { batchImportState = it },
+            requestGrantRelease = { uri -> batchImportCoordinator.requestReadGrantRelease(batchImportWorkflowHost, uri) },
+        )
+        BatchImportDialog(
+            state = batchImportState,
+            isImporting = isImporting,
+            onRetryItem = { itemId ->
+                batchImportCoordinator.retryItem(batchImportWorkflowHost, itemId)
+                scope.launch { batchImportCoordinator.processPending(batchImportWorkflowHost) }
+            },
+            onSkipItem = batchImportSkipActions::onSkipItem,
+            onRetryFailed = {
+                batchImportCoordinator.retryFailed(batchImportWorkflowHost)
+                scope.launch { batchImportCoordinator.processPending(batchImportWorkflowHost) }
+            },
+            onSkipFailed = batchImportSkipActions::onSkipFailed,
+            onDismiss = { batchImportCoordinator.dismiss(batchImportWorkflowHost) },
         )
     }
 

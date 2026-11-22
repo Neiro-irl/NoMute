@@ -3,6 +3,8 @@ package com.neiro.aftertone.ui.theme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
 
 val AftertoneBackground: Color
@@ -45,13 +47,17 @@ private fun AftertonePalette.toColorScheme() = darkColorScheme(
     error = Color(0xFFFFB4AB),
 )
 
+internal val LocalAftertonePalette = staticCompositionLocalOf { AftertonePalette.default }
+
 @Composable
 internal fun AftertoneTheme(
     palette: AftertonePalette = AftertonePalette.default,
     content: @Composable () -> Unit,
 ) {
-    MaterialTheme(
-        colorScheme = palette.toColorScheme(),
-        content = content,
-    )
+    CompositionLocalProvider(LocalAftertonePalette provides palette) {
+        MaterialTheme(
+            colorScheme = palette.toColorScheme(),
+            content = content,
+        )
+    }
 }

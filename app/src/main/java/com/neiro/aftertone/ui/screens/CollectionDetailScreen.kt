@@ -11,9 +11,13 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.HorizontalDivider
@@ -46,18 +50,21 @@ fun CollectionDetailScreen(
     playlist: Playlist?,
     favorites: Boolean,
     onBack: () -> Unit,
+    onPlayTrack: (String) -> Unit,
     onPlayTracks: (List<Track>, String) -> Unit,
+    onAddToQueue: (Track) -> Unit,
     onToggleFavorite: (String) -> Unit,
     onAddToCollection: (String) -> Unit,
     onRemoveFromDevice: (Track) -> Unit,
     onChooseArtwork: (String) -> Unit,
+    onChoosePlaylistArtwork: (String) -> Unit,
     onRemoveFromPlaylist: (String, String) -> Unit,
+    onMoveTrack: (String, String, Int) -> Unit,
 ) {
     val tracks = if (favorites) {
         library.tracks.filter { it.id in library.favoriteTrackIds }
     } else {
-        val trackIds = playlist?.trackIds.orEmpty().toSet()
-        library.tracks.filter { it.id in trackIds }
+        playlist?.tracksInOrder(library.tracks).orEmpty()
     }
     val title = if (favorites) "Избранное" else playlist?.name ?: "Подборка"
     val heroTrack = tracks.firstOrNull()
@@ -77,11 +84,25 @@ fun CollectionDetailScreen(
         }
         item {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                if (heroTrack != null) {
-                    TrackArtwork(heroTrack, Modifier.fillMaxWidth().height(230.dp), cornerRadius = 22)
+                if (heroTrack != null || playlist?.artworkPath != null) {
+                    TrackArtwork(
+                        track = heroTrack,
+                        modifier = Modifier.fillMaxWidth().height(230.dp),
+                        cornerRadius = 22,
+                        artworkPathOverride = playlist?.artworkPath,
+                        artworkDescription = playlist?.let { "Обложка подборки: ${it.name}" },
+                        fallbackLabel = title,
+                    )
                 }
                 Text(title, color = AftertoneText, fontSize = 32.sp, lineHeight = 37.sp, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis)
                 Text("${formatTrackCount(tracks.size)} · хранится на этом устройстве", color = AftertoneMuted, fontSize = 13.sp)
+                if (playlist != null) {
+                    ActionPill(
+                        label = if (playlist.artworkPath == null) "Выбрать обложку" else "Изменить обложку",
+                        icon = Icons.Filled.Add,
+                        onClick = { onChoosePlaylistArtwork(playlist.id) },
+                    )
+                }
                 if (tracks.isNotEmpty()) {
                     ActionPill(
                         label = "Слушать подборку",
@@ -104,12 +125,13 @@ fun CollectionDetailScreen(
             item {
                 Text("ТРЕКИ В ПОДБОРКЕ", color = AftertoneMuted, fontSize = 10.sp, letterSpacing = 1.5.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 4.dp))
             }
-            items(tracks, key = Track::id) { track ->
+            itemsIndexed(tracks, key = { _, track -> track.id }) { index, track ->
                 Column {
                     TrackRow(
                         track = track,
                         isFavorite = track.id in library.favoriteTrackIds,
-                        onClick = { onPlayTracks(tracks, track.id) },
+                        onClick = { onPlayTrack(track.id) },
+                        onAddToQueue = { onAddToQueue(track) },
                         onToggleFavorite = { onToggleFavorite(track.id) },
                         onAddToCollection = { onAddToCollection(track.id) },
                         onRemoveFromDevice = { onRemoveFromDevice(track) },
@@ -118,6 +140,34 @@ fun CollectionDetailScreen(
                             { onRemoveFromPlaylist(playlistId, track.id) }
                         },
                     )
+                    if (playlist != null) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.End,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            IconButton(
+                                onClick = { onMoveTrack(playlist.id, track.id, index - 1) },
+                                enabled = index > 0,
+                            ) {
+                                Icon(
+                                    Icons.Filled.KeyboardArrowUp,
+                                    contentDescription = "Переместить ${track.displayTitle} выше",
+                                    tint = AftertoneMuted,
+                                )
+                            }
+                            IconButton(
+                                onClick = { onMoveTrack(playlist.id, track.id, index + 1) },
+                                enabled = index < tracks.lastIndex,
+                            ) {
+                                Icon(
+                                    Icons.Filled.KeyboardArrowDown,
+                                    contentDescription = "Переместить ${track.displayTitle} ниже",
+                                    tint = AftertoneMuted,
+                                )
+                            }
+                        }
+                    }
                     HorizontalDivider(color = AftertoneOutline.copy(alpha = 0.72f), thickness = 0.6.dp)
                 }
             }

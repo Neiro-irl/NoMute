@@ -3,6 +3,7 @@ package com.neiro.aftertone.storage
 import com.neiro.aftertone.model.LibrarySnapshot
 import com.neiro.aftertone.model.LibraryStateCodec
 import com.neiro.aftertone.model.Playlist
+import com.neiro.aftertone.model.PlaylistArtworkFileName
 import com.neiro.aftertone.model.PrivateAudioPath
 import com.neiro.aftertone.model.Track
 import java.io.File
@@ -217,6 +218,178 @@ class LibraryRestoreTransactionTest {
             assertTrue(fixture.oldAudio.isFile)
             assertTrue(fixture.oldArtwork.isFile)
             assertFalse(fixture.newGeneration.exists())
+        } finally {
+            fixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun failedRestoreRollsBackPlaylistArtworkAndPreservesPreviousCollectionCover() {
+        val fixture = fixture()
+        try {
+            val previousArtworkName = PlaylistArtworkFileName.forCustomCover(
+                "old-mix",
+                "123e4567-e89b-12d3-a456-426614174001",
+            )
+            val previousArtwork = File(fixture.audioDirectory, previousArtworkName).apply { writeBytes(byteArrayOf(51, 52)) }
+            val previousSnapshot = fixture.oldSnapshot.copy(
+                playlists = fixture.oldSnapshot.playlists.map { it.copy(artworkPath = previousArtwork.canonicalPath) },
+            )
+            val previousState = LibraryStateCodec.encode(previousSnapshot)
+            assertTrue(fixture.stateStore.write(previousState))
+
+            val playlistArtworkBytes = byteArrayOf(61, 62, 63, 64)
+            val incomingSnapshot = fixture.portableSnapshot.copy(
+                playlists = fixture.portableSnapshot.playlists.map {
+                    it.copy(artworkPath = "playlist-artwork/new-mix.img")
+                },
+            )
+            val preparedBackup = fixture.preparedBackup().copy(
+                snapshot = incomingSnapshot,
+                summary = BackupSummary(1, 1, 1, (fixture.newAudioBytes.size + fixture.newArtworkBytes.size + playlistArtworkBytes.size).toLong()),
+            )
+            val transaction = fixture.transaction()
+            val staging = transaction.createStagingDirectory()
+            fixture.populateStaging(staging)
+            File(staging, ".playlist-artwork-new-mix.img").writeBytes(playlistArtworkBytes)
+
+            val pending = transaction.prepareRestore(staging, preparedBackup)
+            val incomingArtwork = File(requireNotNull(pending.snapshot.playlists.single().artworkPath))
+            assertEquals(
+                PlaylistArtworkFileName.forCustomCover("new-mix", pending.transactionId),
+                incomingArtwork.name,
+            )
+            assertTrue(incomingArtwork.isFile)
+
+            assertThrows(IOException::class.java) {
+                transaction.commitRestore(pending) { throw IllegalStateException("Injected handoff failure.") }
+            }
+
+            assertEquals(previousState, fixture.stateStore.read())
+            assertTrue("The previous playlist cover must not be deleted during rollback.", previousArtwork.isFile)
+            assertFalse("The newly staged playlist cover must be removed with its failed generation.", incomingArtwork.exists())
+            assertFalse(fixture.newGeneration.exists())
+        } finally {
+            fixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun restoreRejectsPlaylistArtworkSymlinkThatTargetsAnotherStagedAsset() {
+        val fixture = fixture()
+        try {
+            val playlistArtworkBytes = byteArrayOf(61, 62, 63, 64)
+            val incomingSnapshot = fixture.portableSnapshot.copy(
+                playlists = fixture.portableSnapshot.playlists.map {
+                    it.copy(artworkPath = "playlist-artwork/new-mix.img")
+                },
+            )
+            val preparedBackup = fixture.preparedBackup().copy(
+                snapshot = incomingSnapshot,
+                summary = BackupSummary(1, 1, 1, (fixture.newAudioBytes.size + fixture.newArtworkBytes.size + playlistArtworkBytes.size).toLong()),
+            )
+            val transaction = fixture.transaction()
+            val staging = transaction.createStagingDirectory()
+            fixture.populateStaging(staging)
+            val link = File(staging, ".playlist-artwork-new-mix.img")
+            Files.createSymbolicLink(link.toPath(), File(staging, "restored-1.img").toPath())
+
+            assertThrows(IllegalArgumentException::class.java) {
+                transaction.prepareRestore(staging, preparedBackup)
+            }
+
+            assertTrue("Rejecting the staged symlink must preserve the actual referenced track art.", File(staging, "restored-1.img").isFile)
+            assertTrue("The restore operation must not follow or remove the staged symlink.", Files.isSymbolicLink(link.toPath()))
+            assertEquals(fixture.oldEncodedState, fixture.stateStore.read())
+        } finally {
+            fixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun successfulRestoreRemovesPreviousPlaylistArtworkOnlyAfterFinalization() {
+        val fixture = fixture()
+        try {
+            val previousGenerationId = "123e4567-e89b-12d3-a456-426614174002"
+            val previousGeneration = File(fixture.audioDirectory, "restore-$previousGenerationId").apply { mkdir() }
+            File(previousGeneration, PrivateAudioPath.restoreOwnerMarkerName()).writeText(previousGenerationId)
+            val previousPlaylistArtwork = File(
+                previousGeneration,
+                PlaylistArtworkFileName.forCustomCover("old-mix", "123e4567-e89b-12d3-a456-426614174003"),
+            ).apply { writeBytes(byteArrayOf(76, 77, 78)) }
+            val previousSnapshot = LibrarySnapshot(
+                playlists = listOf(Playlist("old-mix", "Старый список", artworkPath = previousPlaylistArtwork.canonicalPath)),
+            )
+            assertTrue(fixture.stateStore.write(LibraryStateCodec.encode(previousSnapshot)))
+
+            val playlistArtworkBytes = byteArrayOf(81, 82, 83, 84)
+            val incomingSnapshot = fixture.portableSnapshot.copy(
+                playlists = fixture.portableSnapshot.playlists.map {
+                    it.copy(artworkPath = "playlist-artwork/new-mix.img")
+                },
+            )
+            val preparedBackup = fixture.preparedBackup().copy(
+                snapshot = incomingSnapshot,
+                summary = BackupSummary(1, 1, 1, (fixture.newAudioBytes.size + fixture.newArtworkBytes.size + playlistArtworkBytes.size).toLong()),
+            )
+            val transaction = fixture.transaction()
+            val staging = transaction.createStagingDirectory()
+            fixture.populateStaging(staging)
+            File(staging, ".playlist-artwork-new-mix.img").writeBytes(playlistArtworkBytes)
+
+            val pending = transaction.prepareRestore(staging, preparedBackup)
+            val incomingArtwork = File(requireNotNull(pending.snapshot.playlists.single().artworkPath))
+            assertTrue(previousPlaylistArtwork.isFile)
+            assertTrue(incomingArtwork.isFile)
+            transaction.commitRestore(pending)
+            assertTrue("Previous collection artwork stays until finalization succeeds.", previousPlaylistArtwork.isFile)
+
+            assertEquals(
+                RestoreFinalizationResult.COMMITTED_AND_CLEANED,
+                transaction.finishRestoreOutcome(pending.transactionId),
+            )
+
+            assertFalse(previousPlaylistArtwork.exists())
+            assertFalse(previousGeneration.exists())
+            assertTrue(incomingArtwork.isFile)
+        } finally {
+            fixture.root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun recoveryRollsBackWhenCommittedPlaylistArtworkNoLongerMatchesItsIntegrityRecord() {
+        val fixture = fixture()
+        try {
+            val playlistArtworkBytes = byteArrayOf(91, 92, 93, 94)
+            val incomingSnapshot = fixture.portableSnapshot.copy(
+                playlists = fixture.portableSnapshot.playlists.map {
+                    it.copy(artworkPath = "playlist-artwork/new-mix.img")
+                },
+            )
+            val preparedBackup = fixture.preparedBackup().copy(
+                snapshot = incomingSnapshot,
+                summary = BackupSummary(1, 1, 1, (fixture.newAudioBytes.size + fixture.newArtworkBytes.size + playlistArtworkBytes.size).toLong()),
+            )
+            val transaction = fixture.transaction()
+            val staging = transaction.createStagingDirectory()
+            fixture.populateStaging(staging)
+            File(staging, ".playlist-artwork-new-mix.img").writeBytes(playlistArtworkBytes)
+            val pending = transaction.prepareRestore(staging, preparedBackup)
+            transaction.commitRestore(pending)
+            val incomingArtwork = File(requireNotNull(pending.snapshot.playlists.single().artworkPath))
+            incomingArtwork.writeBytes(byteArrayOf(1, 1, 1, 1))
+
+            assertEquals(
+                RestoreFinalizationResult.ROLLED_BACK_AND_CLEANED,
+                transaction.finishRestoreOutcome(pending.transactionId),
+            )
+
+            assertEquals(fixture.oldEncodedState, fixture.stateStore.read())
+            assertTrue(fixture.oldAudio.isFile)
+            assertTrue(fixture.oldArtwork.isFile)
+            assertFalse(incomingArtwork.exists())
+            assertFalse(fixture.audioDirectory.resolve("restore-${pending.transactionId}").exists())
         } finally {
             fixture.root.deleteRecursively()
         }
@@ -1270,6 +1443,12 @@ class LibraryRestoreTransactionTest {
                 val audio = File(track.filePath)
                 require(audio.isFile && (PrivateAudioPath.isDirectChild(audioDirectory, audio) || PrivateAudioPath.isOwnedRestoreFile(audioDirectory, audio)))
                 track.artworkPath?.let { path ->
+                    val artwork = File(path)
+                    require(artwork.isFile && (PrivateAudioPath.isDirectChild(audioDirectory, artwork) || PrivateAudioPath.isOwnedRestoreFile(audioDirectory, artwork)))
+                }
+            }
+            snapshot.playlists.forEach { playlist ->
+                playlist.artworkPath?.let { path ->
                     val artwork = File(path)
                     require(artwork.isFile && (PrivateAudioPath.isDirectChild(audioDirectory, artwork) || PrivateAudioPath.isOwnedRestoreFile(audioDirectory, artwork)))
                 }

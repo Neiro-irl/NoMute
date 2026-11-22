@@ -28,11 +28,14 @@ fun TrackArtwork(
     track: Track?,
     modifier: Modifier = Modifier,
     cornerRadius: Int = 22,
+    artworkPathOverride: String? = null,
+    artworkDescription: String? = null,
+    fallbackLabel: String? = null,
 ) {
-    val artworkPath = track?.artworkPath
-    val bitmap = produceState<android.graphics.Bitmap?>(initialValue = null, key1 = artworkPath) {
+    val artworkPaths = artworkPathCandidates(artworkPathOverride, track?.artworkPath)
+    val bitmap = produceState<android.graphics.Bitmap?>(initialValue = null, key1 = artworkPaths) {
         value = withContext(Dispatchers.IO) {
-            artworkPath?.let { path -> runCatching { decodeArtwork(path) }.getOrNull() }
+            artworkPaths.firstNotNullOfOrNull { path -> runCatching { decodeArtwork(path) }.getOrNull() }
         }
     }.value
     val shape = RoundedCornerShape(cornerRadius.dp)
@@ -46,13 +49,15 @@ fun TrackArtwork(
         if (bitmap != null) {
             Image(
                 bitmap = bitmap.asImageBitmap(),
-                contentDescription = track?.let { "Обложка альбома: ${it.displayTitle}" },
+                contentDescription = artworkDescription ?: track?.let { "Обложка альбома: ${it.displayTitle}" },
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize(),
             )
         } else {
             Text(
-                text = track?.displayTitle?.firstOrNull()?.uppercaseChar()?.toString() ?: "A",
+                text = track?.displayTitle?.firstOrNull()?.uppercaseChar()?.toString()
+                    ?: fallbackLabel?.firstOrNull()?.uppercaseChar()?.toString()
+                    ?: "A",
                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.9f),
                 fontSize = 42.sp,
                 fontWeight = FontWeight.Light,

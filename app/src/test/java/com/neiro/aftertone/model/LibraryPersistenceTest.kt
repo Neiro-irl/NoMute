@@ -33,6 +33,58 @@ class LibraryPersistenceTest {
     }
 
     @Test
+    fun schemaV1KeepsPlaylistOrderDifferentFromTrackStorageOrder() {
+        val legacyState = """
+            version=1
+            tracks.count=2
+            track.0.id=first
+            track.0.title=First
+            track.0.artist=Artist
+            track.0.album=
+            track.0.duration=1000
+            track.0.file=/audio/first.mp3
+            track.1.id=second
+            track.1.title=Second
+            track.1.artist=Artist
+            track.1.album=
+            track.1.duration=2000
+            track.1.file=/audio/second.mp3
+            playlists.count=1
+            playlist.0.id=mix
+            playlist.0.name=Mix
+            playlist.0.tracks.count=2
+            playlist.0.track.0=second
+            playlist.0.track.1=first
+            favorites.count=0
+        """.trimIndent()
+
+        val decoded = LibraryStateCodec.decode(legacyState)
+
+        assertEquals(listOf("second", "first"), decoded.playlists.single().trackIds)
+        assertNull(decoded.playlists.single().artworkPath)
+    }
+
+    @Test
+    fun versionTwoCodecRoundTripsPlaylistArtworkPath() {
+        val snapshot = LibrarySnapshot(
+            tracks = listOf(Track("track-1", "First", "Artist", filePath = "/audio/track-1.mp3")),
+            playlists = listOf(
+                Playlist(
+                    id = "mix-1",
+                    name = "Mix",
+                    trackIds = listOf("track-1"),
+                    artworkPath = "/audio/mix-1-playlist-artwork-00000000-0000-0000-0000-000000000041.img",
+                ),
+            ),
+        )
+
+        val encoded = LibraryStateCodec.encode(snapshot)
+
+        assertTrue(encoded.contains("version=2"))
+        assertEquals(snapshot, LibraryStateCodec.decode(encoded))
+    }
+
+    @Test
     fun codecPersistsRequestIdAndCompletedHandoffForRetryAfterProcessRecreation() {
         val requestId = "f1557c4e-6670-4bc1-a595-914433c9a8d3"
         val snapshot = LibrarySnapshot(

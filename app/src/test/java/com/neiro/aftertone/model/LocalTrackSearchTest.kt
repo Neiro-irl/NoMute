@@ -15,14 +15,14 @@ class LocalTrackSearchTest {
     fun matchesTitleArtistAndAlbumWithoutCaseSensitivity() {
         val resultIds = filterLocalTracks(tracks, "aMbEr").map(Track::id)
 
-        assertEquals(listOf("alpha", "artist", "album"), resultIds)
+        assertEquals(listOf("artist", "album", "alpha"), resultIds)
     }
 
     @Test
-    fun blankQueryReturnsEveryTrackSortedByDisplayTitle() {
+    fun blankQueryPreservesTheIncomingLibraryOrder() {
         val resultTitles = filterLocalTracks(tracks, "   ").map(Track::displayTitle)
 
-        assertEquals(listOf("Amber Morning", "Blue Room", "Quiet Lines", "Zulu Lights"), resultTitles)
+        assertEquals(listOf("Zulu Lights", "Blue Room", "Quiet Lines", "Amber Morning"), resultTitles)
     }
 
     @Test

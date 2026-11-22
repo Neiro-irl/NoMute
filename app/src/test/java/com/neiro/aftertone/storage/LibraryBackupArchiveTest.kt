@@ -3,6 +3,7 @@ package com.neiro.aftertone.storage
 import com.neiro.aftertone.model.LibrarySnapshot
 import com.neiro.aftertone.model.LibraryStateCodec
 import com.neiro.aftertone.model.Playlist
+import com.neiro.aftertone.model.PlaylistArtworkFileName
 import com.neiro.aftertone.model.Track
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -85,6 +86,172 @@ class LibraryBackupArchiveTest {
             val restored = LibraryBackupArchive.extract(archive, staging, availableBytes = { Long.MAX_VALUE })
             assertEquals("artwork/track-1.img", restored.snapshot.tracks.single().artworkPath)
             assertTrue(File(staging, "track-1.img").readBytes().contentEquals(selectedArtworkBytes))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun exportAndExtractRoundTripPlaylistArtworkThroughPortableAssetName() {
+        val root = Files.createTempDirectory("aftertone-playlist-backup-roundtrip-").toFile()
+        try {
+            val source = fixture(root)
+            val playlistId = "track-1"
+            val privateName = PlaylistArtworkFileName.forCustomCover(
+                playlistId,
+                "123e4567-e89b-12d3-a456-426614174000",
+            )
+            val collectionArtworkBytes = byteArrayOf(14, 15, 16, 17)
+            val collectionArtwork = File(source.audioDirectory, privateName).apply { writeBytes(collectionArtworkBytes) }
+            val selectedSnapshot = source.snapshot.copy(
+                playlists = source.snapshot.playlists.map {
+                    it.copy(id = playlistId, artworkPath = collectionArtwork.canonicalPath)
+                },
+            )
+            val archive = File(root, "playlist-artwork.zip")
+
+            LibraryBackupArchive.export(selectedSnapshot, source.audioDirectory, archive.outputStream())
+
+            val entries = readEntries(archive)
+            val manifestVersion = ZipFile(archive).use { zip ->
+                DataInputStream(zip.getInputStream(zip.getEntry(LibraryBackupArchive.MANIFEST_ENTRY))).use { input ->
+                    input.skipBytes(8)
+                    input.readInt()
+                }
+            }
+            assertEquals(2, manifestVersion)
+            assertTrue(entries.any { it.first == "playlist-artwork/track-1.img" && it.second.contentEquals(collectionArtworkBytes) })
+            assertFalse(entries.any { privateName in it.first })
+
+            val staging = File(root, "playlist-artwork-staging").apply { mkdir() }
+            val prepared = LibraryBackupArchive.extract(archive, staging, availableBytes = { Long.MAX_VALUE })
+
+            assertEquals("playlist-artwork/track-1.img", prepared.snapshot.playlists.single().artworkPath)
+            assertTrue(File(staging, "track-1.img").readBytes().contentEquals(source.artworkBytes))
+            assertTrue(File(staging, ".playlist-artwork-track-1.img").readBytes().contentEquals(collectionArtworkBytes))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun exportRejectsPlaylistArtworkSymlinkEvenWhenItsTargetIsOwned() {
+        val root = Files.createTempDirectory("aftertone-playlist-artwork-symlink-").toFile()
+        try {
+            val source = fixture(root)
+            val link = File(
+                source.audioDirectory,
+                PlaylistArtworkFileName.forCustomCover(
+                    "playlist-1",
+                    "123e4567-e89b-12d3-a456-426614174004",
+                ),
+            )
+            Files.createSymbolicLink(link.toPath(), File(source.audioDirectory, "track-1.img").toPath())
+            val selectedSnapshot = source.snapshot.copy(
+                playlists = source.snapshot.playlists.map { it.copy(artworkPath = link.absolutePath) },
+            )
+
+            assertThrows(IllegalArgumentException::class.java) {
+                LibraryBackupArchive.export(selectedSnapshot, source.audioDirectory, ByteArrayOutputStream())
+            }
+            assertTrue("Rejecting the symlink must not affect its owned image target.", File(source.audioDirectory, "track-1.img").isFile)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun acceptsLegacyVersionOneManifestAndStateWithoutPlaylistArtwork() {
+        val root = Files.createTempDirectory("aftertone-legacy-backup-v1-").toFile()
+        try {
+            val source = fixture(root)
+            val portableSnapshot = source.snapshot.copy(
+                tracks = source.snapshot.tracks.map {
+                    it.copy(filePath = "audio/track-1.mp3", artworkPath = "artwork/track-1.img")
+                },
+            )
+            val assets = listOf(
+                LibraryBackupAsset("audio/track-1.mp3", source.audioBytes.size.toLong()),
+                LibraryBackupAsset("artwork/track-1.img", source.artworkBytes.size.toLong()),
+            )
+            val archive = File(root, "legacy-v1.zip").apply {
+                writeBytes(
+                    rawZip(
+                        listOf(
+                            RawEntry(LibraryBackupArchive.MANIFEST_ENTRY, legacyV1Manifest(portableSnapshot, assets)),
+                            RawEntry("audio/track-1.mp3", source.audioBytes),
+                            RawEntry("artwork/track-1.img", source.artworkBytes),
+                        ),
+                    ),
+                )
+            }
+            val staging = File(root, "legacy-v1-staging").apply { mkdir() }
+
+            val inspected = LibraryBackupArchive.inspect(archive)
+            val prepared = LibraryBackupArchive.extract(archive, staging, availableBytes = { Long.MAX_VALUE })
+
+            assertEquals(1, inspected.trackCount)
+            assertEquals(null, prepared.snapshot.playlists.single().artworkPath)
+            assertTrue(File(staging, "track-1.mp3").isFile)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun rejectsPlaylistArtworkPathTraversalInPortableManifest() {
+        val root = Files.createTempDirectory("aftertone-playlist-manifest-traversal-").toFile()
+        try {
+            val source = fixture(root)
+            val portableSnapshot = source.snapshot.copy(
+                tracks = source.snapshot.tracks.map {
+                    it.copy(filePath = "audio/track-1.mp3", artworkPath = "artwork/track-1.img")
+                },
+                playlists = source.snapshot.playlists.map {
+                    it.copy(artworkPath = "playlist-artwork/../outside.img")
+                },
+            )
+            val assets = listOf(
+                LibraryBackupAsset("audio/track-1.mp3", source.audioBytes.size.toLong()),
+                LibraryBackupAsset("artwork/track-1.img", source.artworkBytes.size.toLong()),
+            )
+
+            assertThrows(IllegalArgumentException::class.java) {
+                LibraryBackupManifestCodec.encode(LibraryStateCodec.encode(portableSnapshot), assets)
+            }
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun rejectsCrossPlaylistArtworkReferencesInPortableManifest() {
+        val root = Files.createTempDirectory("aftertone-playlist-manifest-owner-").toFile()
+        try {
+            val source = fixture(root)
+            val portableTrack = source.snapshot.tracks.single().copy(
+                filePath = "audio/track-1.mp3",
+                artworkPath = "artwork/track-1.img",
+            )
+            val firstArtworkPath = "playlist-artwork/playlist-1.img"
+            val crossReferencedSnapshot = source.snapshot.copy(
+                tracks = listOf(portableTrack),
+                playlists = listOf(
+                    source.snapshot.playlists.single().copy(artworkPath = firstArtworkPath),
+                    Playlist("playlist-2", "Другое", listOf("track-1"), artworkPath = firstArtworkPath),
+                ),
+            )
+            val commonAssets = listOf(
+                LibraryBackupAsset("audio/track-1.mp3", source.audioBytes.size.toLong()),
+                LibraryBackupAsset("artwork/track-1.img", source.artworkBytes.size.toLong()),
+            )
+
+            assertThrows(IllegalArgumentException::class.java) {
+                LibraryBackupManifestCodec.encode(
+                    LibraryStateCodec.encode(crossReferencedSnapshot),
+                    commonAssets,
+                )
+            }
         } finally {
             root.deleteRecursively()
         }
@@ -1220,6 +1387,33 @@ class LibraryBackupArchiveTest {
             audioEntry,
             RawEntry("artwork/track-1.img", source.artworkBytes),
         )
+    }
+
+    private fun legacyV1Manifest(
+        snapshot: LibrarySnapshot,
+        assets: List<LibraryBackupAsset>,
+    ): ByteArray {
+        val encodedState = LibraryStateCodec.encode(snapshot).replaceFirst("version=2", "version=1")
+        require("version=1" in encodedState)
+        val stateBytes = encodedState.toByteArray(Charsets.UTF_8)
+        return ByteArrayOutputStream().also { bytes ->
+            DataOutputStream(bytes).use { output ->
+                output.write(
+                    byteArrayOf(
+                        0x41.toByte(), 0x46.toByte(), 0x54.toByte(), 0x52.toByte(),
+                        0x42.toByte(), 0x4b.toByte(), 0x55.toByte(), 0x50.toByte(),
+                    ),
+                )
+                output.writeInt(1)
+                output.writeInt(stateBytes.size)
+                output.write(stateBytes)
+                output.writeInt(assets.size)
+                assets.forEach { asset ->
+                    output.writeUTF(asset.entryName)
+                    output.writeLong(asset.sizeBytes)
+                }
+            }
+        }.toByteArray()
     }
 
     private fun patchCentralCompressedSize(bytes: ByteArray, target: String, sizeBytes: Int): ByteArray {

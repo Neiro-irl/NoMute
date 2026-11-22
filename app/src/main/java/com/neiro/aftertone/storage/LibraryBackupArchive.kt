@@ -3,6 +3,7 @@ package com.neiro.aftertone.storage
 import com.neiro.aftertone.model.LibrarySnapshot
 import com.neiro.aftertone.model.LibraryStateCodec
 import com.neiro.aftertone.model.PrivateAudioPath
+import com.neiro.aftertone.model.PlaylistArtworkFileName
 import com.neiro.aftertone.model.TrackArtworkFileName
 import com.neiro.aftertone.model.TrackFileName
 import java.io.ByteArrayOutputStream
@@ -13,6 +14,8 @@ import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.io.RandomAccessFile
+import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.security.MessageDigest
 import java.util.Enumeration
 import java.util.concurrent.CancellationException
@@ -125,7 +128,30 @@ internal object LibraryBackupArchive {
                 artworkPath = artworkFile?.let { "artwork/${track.id}.img" },
             )
         }
-        val portableSnapshot = snapshot.copy(tracks = portableTracks)
+        val portablePlaylists = snapshot.playlists.map { playlist ->
+            checkCancelled()
+            val artworkFile = playlist.artworkPath?.let { path ->
+                File(path).also { file ->
+                    require(
+                        PlaylistArtworkFileName.isGeneratedFileName(playlist.id, file.name) &&
+                            isOwnedAudioFile(audioDirectory, file) &&
+                            Files.isRegularFile(file.toPath(), LinkOption.NOFOLLOW_LINKS),
+                    ) {
+                        "A playlist's artwork is missing or outside the app's private storage."
+                    }
+                    require(file.length() in 1..limits.maxArtworkBytes) {
+                        "A playlist artwork file exceeds the backup size limit."
+                    }
+                }
+            }
+            artworkFile?.let { file ->
+                val artworkEntry = "playlist-artwork/${playlist.id}.img"
+                assets += LibraryBackupAsset(artworkEntry, file.length())
+                assetSources[artworkEntry] = file
+            }
+            playlist.copy(artworkPath = artworkFile?.let { "playlist-artwork/${playlist.id}.img" })
+        }
+        val portableSnapshot = snapshot.copy(tracks = portableTracks, playlists = portablePlaylists)
         val encodedState = LibraryStateCodec.encode(portableSnapshot)
         val manifest = LibraryBackupManifestCodec.encode(encodedState, assets, limits)
         require(assets.size + 1 <= limits.maxEntries) { "The backup contains too many files." }
@@ -290,7 +316,7 @@ internal object LibraryBackupArchive {
                 RandomAccessFile(archiveFile, "r").use { compressedArchive ->
                     manifest.assets.forEach { asset ->
                         checkCancelled()
-                        val baseName = asset.entryName.substringAfter('/')
+                        val baseName = stagingFileName(asset.entryName)
                         val destination = File(stagingDirectory, baseName)
                         require(PrivateAudioPath.isDirectChild(stagingDirectory, destination)) {
                             "The restore target is outside its private staging directory."
@@ -1208,10 +1234,21 @@ internal object LibraryBackupArchive {
     }
 
     private fun isOwnedAudioFile(audioDirectory: File, file: File): Boolean =
-        PrivateAudioPath.isDirectChild(audioDirectory, file) || PrivateAudioPath.isOwnedRestoreFile(audioDirectory, file)
+        !Files.isSymbolicLink(file.toPath()) &&
+            Files.isRegularFile(file.toPath(), LinkOption.NOFOLLOW_LINKS) &&
+            (PrivateAudioPath.isDirectChild(audioDirectory, file) || PrivateAudioPath.isOwnedRestoreFile(audioDirectory, file))
+
+    private fun stagingFileName(entryName: String): String {
+        if (!entryName.startsWith("playlist-artwork/")) return entryName.substringAfter('/')
+        val playlistId = entryName.removePrefix("playlist-artwork/").removeSuffix(".img")
+        require(PlaylistArtworkFileName.isSafePlaylistId(playlistId) && entryName == "playlist-artwork/$playlistId.img") {
+            "The backup contains an unsafe playlist artwork path."
+        }
+        return ".playlist-artwork-$playlistId.img"
+    }
 
     private fun isAllowedZipAssetName(name: String): Boolean =
-        name.startsWith("audio/") || name.startsWith("artwork/")
+        name.startsWith("audio/") || name.startsWith("artwork/") || name.startsWith("playlist-artwork/")
 
     private fun summary(snapshot: LibrarySnapshot, payloadBytes: Long) = BackupSummary(
         trackCount = snapshot.tracks.size,

@@ -233,6 +233,9 @@ class MainActivity : ComponentActivity() {
     private var undurableExternalAudioRequestQueue: ExternalAudioOpenRequestQueueSnapshot? = null
     private var externalAudioQueueRecoveryDialog: AlertDialog? = null
     private val externalAudioQueueMutationMutex = Mutex()
+    private val persistedUriGrantOwnership = PersistedUriGrantOwnership()
+    private var externalAudioQueueRestoreCompleted = false
+    private var externalAudioQueueClaimsKnown = false
     private val pendingExternalAudioRequests: List<ExternalAudioOpenRequest>
         get() = externalAudioOpenRequestQueue.pendingRequests
 
@@ -257,6 +260,9 @@ class MainActivity : ComponentActivity() {
         }
         val retainedIntent = currentExternalAudioIntent.sanitizedIntent
         retainedIntent?.let(::setIntent)
+        val initialIncomingAudioGrantClaim = currentExternalAudioIntent.request?.request?.uri
+            ?.takeIf { it.scheme?.lowercase(Locale.ROOT) == "content" }
+            ?.let(persistedUriGrantOwnership::claimIncomingExternalAudioRequest)
         currentExternalAudioIntent.request?.let {
             persistExternalAudioReadPermission(currentExternalAudioIntent.intentFlags, it.request.uri)
         }
@@ -319,28 +325,44 @@ class MainActivity : ComponentActivity() {
                             )
                         }
                     },
+                    onBatchImportUriClaimsChanged = ::updateBatchImportUriClaims,
+                    onBatchImportUriNoLongerNeeded = ::releaseExternalAudioReadGrantIfUnused,
                 )
             }
         }
         lifecycleScope.launch {
-            if (!canProcessExternalAudioQueue(BuildConfig.RECOVERY_DIAGNOSTIC_READ_ONLY)) return@launch
-            externalAudioQueueMutationMutex.withLock {
-                val restoreUpdate = withExternalAudioQueueIo {
-                    externalAudioOpenRequestQueueStore.restore(
-                        savedStateRequests = savedStateRequests,
-                        currentIntentRequest = currentExternalAudioIntent.request?.request,
-                        suppressAcknowledgedUriOnRecreation = suppressAcknowledgedUriOnRecreation,
-                        hasPersistedReadPermission = ::hasPersistedExternalAudioReadPermission,
+            try {
+                if (!canProcessExternalAudioQueue(BuildConfig.RECOVERY_DIAGNOSTIC_READ_ONLY)) return@launch
+                externalAudioQueueMutationMutex.withLock {
+                    val restoreUpdate = withExternalAudioQueueIo {
+                        externalAudioOpenRequestQueueStore.restore(
+                            savedStateRequests = savedStateRequests,
+                            currentIntentRequest = currentExternalAudioIntent.request?.request,
+                            suppressAcknowledgedUriOnRecreation = suppressAcknowledgedUriOnRecreation,
+                            hasPersistedReadPermission = ::hasPersistedExternalAudioReadPermission,
+                        )
+                    }
+                    bindCurrentIntentRequestId(
+                        retainedIntent,
+                        currentExternalAudioIntent.request?.request,
+                        restoreUpdate,
+                        allowAcknowledgedBinding = suppressAcknowledgedUriOnRecreation,
                     )
+                    applyExternalAudioOpenRequestQueueUpdate(restoreUpdate)
+                    externalAudioQueueRestoreCompleted = true
+                    if (restoreUpdate.storeProblem == null ||
+                        restoreUpdate.storeProblem == ExternalAudioOpenQueueStoreProblem.WriteFailure
+                    ) {
+                        externalAudioQueueClaimsKnown = true
+                        persistedUriGrantOwnership.updateExternalAudioQueueUris(currentExternalAudioQueueUris())
+                            .forEach(::releasePersistedExternalAudioReadGrant)
+                    }
                 }
-                bindCurrentIntentRequestId(
-                    retainedIntent,
-                    currentExternalAudioIntent.request?.request,
-                    restoreUpdate,
-                    allowAcknowledgedBinding = suppressAcknowledgedUriOnRecreation,
-                )
-                applyExternalAudioOpenRequestQueueUpdate(restoreUpdate)
-                currentExternalAudioIntent.request?.request?.let { releaseExternalAudioReadGrantIfUnused(it.uri) }
+            } finally {
+                initialIncomingAudioGrantClaim?.let { claim ->
+                    persistedUriGrantOwnership.finishIncomingExternalAudioRequest(claim)
+                        .forEach(::releasePersistedExternalAudioReadGrant)
+                }
             }
         }
     }
@@ -401,26 +423,35 @@ class MainActivity : ComponentActivity() {
         if (!canProcessExternalAudioQueue(BuildConfig.RECOVERY_DIAGNOSTIC_READ_ONLY)) return
         val incomingIntent = preparedIntent.request ?: return
         val incomingRequest = incomingIntent.request
+        val incomingGrantClaim = incomingRequest.uri
+            .takeIf { it.scheme?.lowercase(Locale.ROOT) == "content" }
+            ?.let(persistedUriGrantOwnership::claimIncomingExternalAudioRequest)
         persistExternalAudioReadPermission(preparedIntent.intentFlags, incomingRequest.uri)
         lifecycleScope.launch {
-            externalAudioQueueMutationMutex.withLock {
-                val retryCandidate = undurableExternalAudioRequestQueue
-                val base = retryCandidate ?: externalAudioOpenRequestQueue
-                val update = withExternalAudioQueueIo {
-                    externalAudioOpenRequestQueueStore.enqueue(
-                        snapshot = base,
-                        incomingRequest = incomingRequest,
-                        useProvidedSnapshotAsBase = retryCandidate != null,
+            try {
+                externalAudioQueueMutationMutex.withLock {
+                    val retryCandidate = undurableExternalAudioRequestQueue
+                    val base = retryCandidate ?: externalAudioOpenRequestQueue
+                    val update = withExternalAudioQueueIo {
+                        externalAudioOpenRequestQueueStore.enqueue(
+                            snapshot = base,
+                            incomingRequest = incomingRequest,
+                            useProvidedSnapshotAsBase = retryCandidate != null,
+                        )
+                    }
+                    bindCurrentIntentRequestId(
+                        preparedIntent.sanitizedIntent,
+                        incomingRequest,
+                        update,
+                        bindMatchingUri = false,
                     )
+                    applyExternalAudioOpenRequestQueueUpdate(update)
                 }
-                bindCurrentIntentRequestId(
-                    preparedIntent.sanitizedIntent,
-                    incomingRequest,
-                    update,
-                    bindMatchingUri = false,
-                )
-                applyExternalAudioOpenRequestQueueUpdate(update)
-                releaseExternalAudioReadGrantIfUnused(incomingRequest.uri)
+            } finally {
+                incomingGrantClaim?.let { claim ->
+                    persistedUriGrantOwnership.finishIncomingExternalAudioRequest(claim)
+                        .forEach(::releasePersistedExternalAudioReadGrant)
+                }
             }
         }
     }
@@ -504,6 +535,15 @@ class MainActivity : ComponentActivity() {
         undurableExternalAudioRequestQueue =
             externalAudioQueueRetryCandidateAfterUpdate(undurableExternalAudioRequestQueue, update)
         externalAudioOpenRequestQueue = externalAudioOpenQueueAfterUpdate(externalAudioOpenRequestQueue, update)
+        if (externalAudioQueueRestoreCompleted &&
+            (update.storeProblem == null || update.storeProblem == ExternalAudioOpenQueueStoreProblem.WriteFailure)
+        ) {
+            externalAudioQueueClaimsKnown = true
+        }
+        if (externalAudioQueueClaimsKnown) {
+            persistedUriGrantOwnership.updateExternalAudioQueueUris(currentExternalAudioQueueUris())
+                .forEach(::releasePersistedExternalAudioReadGrant)
+        }
         if (update.persisted) {
             val currentUris = buildSet {
                 externalAudioOpenRequestQueue.pendingRequests.forEach { add(it.uri) }
@@ -563,9 +603,25 @@ class MainActivity : ComponentActivity() {
 
     private fun releaseExternalAudioReadGrantIfUnused(uri: Uri) {
         if (uri.scheme?.lowercase(Locale.ROOT) != "content") return
-        val stillQueued = externalAudioOpenRequestQueue.pendingRequests.any { it.uri == uri } ||
-            undurableExternalAudioRequestQueue?.pendingRequests.orEmpty().any { it.uri == uri }
-        if (stillQueued) return
+        persistedUriGrantOwnership.requestRelease(uri)
+            .forEach(::releasePersistedExternalAudioReadGrant)
+    }
+
+    private fun updateBatchImportUriClaims(claims: Set<Uri>) {
+        val contentClaims = claims.filterTo(linkedSetOf()) { uri ->
+            uri.scheme?.lowercase(Locale.ROOT) == "content"
+        }
+        persistedUriGrantOwnership.updateBatchImportUriClaims(contentClaims)
+            .forEach(::releasePersistedExternalAudioReadGrant)
+    }
+
+    private fun currentExternalAudioQueueUris(): Set<Uri> = buildSet {
+        externalAudioOpenRequestQueue.pendingRequests.forEach { add(it.uri) }
+        undurableExternalAudioRequestQueue?.pendingRequests?.forEach { add(it.uri) }
+    }
+
+    private fun releasePersistedExternalAudioReadGrant(uri: Uri) {
+        if (uri.scheme?.lowercase(Locale.ROOT) != "content") return
         val hasPersistedGrant = runCatching {
             contentResolver.persistedUriPermissions.any { it.uri == uri && it.isReadPermission }
         }.getOrDefault(false)

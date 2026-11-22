@@ -8,6 +8,7 @@ import androidx.core.content.edit
 import com.neiro.aftertone.model.LibrarySnapshot
 import com.neiro.aftertone.model.LibraryStateCodec
 import com.neiro.aftertone.model.Playlist
+import com.neiro.aftertone.model.PlaylistArtworkFileName
 import com.neiro.aftertone.model.PrivateAudioPath
 import com.neiro.aftertone.model.TrackArtworkFileName
 import com.neiro.aftertone.model.Track
@@ -46,6 +47,9 @@ class LocalLibraryRepository internal constructor(
         File(context.applicationContext.filesDir, "audio"),
     ),
     private val durability: AudioImportDurability = AndroidAudioImportDurability,
+    private val playlistArtworkImporter: PlaylistArtworkImporter = LocalArtworkImporter(
+        File(context.applicationContext.filesDir, "audio"),
+    ),
 ) {
     constructor(context: Context) : this(
         context,
@@ -118,6 +122,7 @@ class LocalLibraryRepository internal constructor(
     )
     private var preparedArchiveSweepComplete = false
     private var importArtifactSweepComplete = false
+    private var playlistArtworkOrphanSweepComplete = false
 
     @Synchronized
     fun load(): LibrarySnapshot = synchronized(importArtifactLock) {
@@ -135,7 +140,7 @@ class LocalLibraryRepository internal constructor(
         if (scopedRecoveryAttemptState != null && scopedRecoveryAttemptState != SCOPED_RECOVERY_ATTEMPT_COMPLETE) {
             if (scopedRecoveryRetryAuthorizationGrantedInProcess && !scopedRecoveryAttemptInProgress) {
                 scopedRecoveryRetryAuthorizationGrantedInProcess = false
-                return@synchronized runScopedRecoveryAttempt()
+                return@synchronized runScopedRecoveryAttemptAndSweepPlaylistArtwork()
             }
             blockAfterConsumedScopedRecoveryAttempt(scopedRecoveryAttemptState)
             return@synchronized decodeStoredSnapshot(stateStore.read())
@@ -145,7 +150,7 @@ class LocalLibraryRepository internal constructor(
             return@synchronized decodeStoredSnapshot(stateStore.read())
         }
         if (scopedRecoveryAttemptState == null) {
-            return@synchronized runScopedRecoveryAttempt()
+            return@synchronized runScopedRecoveryAttemptAndSweepPlaylistArtwork()
         }
         if (!preparedArchiveSweepComplete) {
             runCatching {
@@ -181,6 +186,9 @@ class LocalLibraryRepository internal constructor(
             importArtifactSweepComplete = runCatching { cleanupAbandonedImportArtifacts(snapshot) }.getOrDefault(false)
         }
         restoreActionGate.unblock()
+        if (recoveryCompleted && restoreActionGate.pendingCleanupTransactionId == null && !restoreActionGate.isBlocked) {
+            cleanupPlaylistArtworkOrphansOnce(snapshot)
+        }
         snapshot
     }
 
@@ -220,6 +228,14 @@ class LocalLibraryRepository internal constructor(
         } finally {
             scopedRecoveryAttemptInProgress = false
         }
+    }
+
+    private fun runScopedRecoveryAttemptAndSweepPlaylistArtwork(): LibrarySnapshot {
+        val snapshot = runScopedRecoveryAttempt()
+        if (restoreActionGate.pendingCleanupTransactionId == null && !restoreActionGate.isBlocked) {
+            cleanupPlaylistArtworkOrphansOnce(snapshot)
+        }
+        return snapshot
     }
 
     private fun blockAfterConsumedScopedRecoveryAttempt(attemptState: String?) {
@@ -411,14 +427,22 @@ class LocalLibraryRepository internal constructor(
         synchronized(importArtifactLock) { restoreTransaction.finishRestoreOutcome(transactionId) }
 
     @Synchronized
-    fun import(uri: Uri): Track = importDocument(uri, externalRequestId = null)
+    fun import(uri: Uri): Track = importDocument(uri, externalRequestId = null, stableTrackId = null)
+
+    @Synchronized
+    internal fun importBatch(uri: Uri, batchItemId: String): Track {
+        require(runCatching { UUID.fromString(batchItemId).toString() == batchItemId }.getOrDefault(false)) {
+            "The batch import ID is invalid."
+        }
+        return importDocument(uri, externalRequestId = null, stableTrackId = batchItemId)
+    }
 
     @Synchronized
     internal fun importExternal(uri: Uri, requestId: String): Track {
         require(runCatching { UUID.fromString(requestId).toString() == requestId }.getOrDefault(false)) {
             "The external audio request ID is invalid."
         }
-        return importDocument(uri, externalRequestId = requestId)
+        return importDocument(uri, externalRequestId = requestId, stableTrackId = null)
     }
 
     @Synchronized
@@ -584,14 +608,29 @@ class LocalLibraryRepository internal constructor(
             ?: throw IOException("The completed external handoff could not be read back from the local library.")
     }
 
-    private fun importDocument(uri: Uri, externalRequestId: String?): Track = synchronized(importArtifactLock) {
+    private fun importDocument(uri: Uri, externalRequestId: String?, stableTrackId: String?): Track = synchronized(importArtifactLock) {
         val current = load()
         if (externalRequestId != null) {
             current.tracks.firstOrNull { it.externalImportRequestId == externalRequestId }?.let { return@synchronized it }
         }
+        if (stableTrackId != null) {
+            current.tracks.firstOrNull { it.id == stableTrackId }?.let { return@synchronized it }
+        }
+        val stableIdImporter = if (stableTrackId == null) null else importer as? StableIdAudioTrackImporter
+            ?: throw IOException("The audio importer does not support retry-safe batch imports.")
+        if (stableTrackId != null && !cleanupAbandonedImportArtifacts(current, onlyStableTrackId = stableTrackId)) {
+            throw IOException("An incomplete batch import artifact could not be safely cleaned up.")
+        }
         ensureAudioDirectory()
         val document = audioDocumentSource.open(uri)
-        val imported = importer.import(document.input, document.displayName, document.mimeType)
+        val imported = if (stableTrackId == null) {
+            importer.import(document.input, document.displayName, document.mimeType)
+        } else {
+            stableIdImporter!!.importWithId(document.input, document.displayName, document.mimeType, stableTrackId)
+        }
+        if (stableTrackId != null && imported.id != stableTrackId) {
+            throw IOException("The audio importer did not preserve the batch item ID.")
+        }
         val track = imported.copy(externalImportRequestId = externalRequestId)
 
         try {
@@ -647,8 +686,40 @@ class LocalLibraryRepository internal constructor(
     }
 
     @Synchronized
+    fun moveTrackInPlaylist(playlistId: String, trackId: String, destinationIndex: Int): LibrarySnapshot =
+        synchronized(importArtifactLock) {
+            val current = load()
+            val playlist = current.playlists.firstOrNull { it.id == playlistId } ?: return@synchronized current
+            val reordered = playlist.moveTrack(trackId, destinationIndex)
+            if (reordered === playlist) return@synchronized current
+            persist(
+                current.copy(
+                    playlists = current.playlists.map { existing ->
+                        if (existing.id == playlistId) reordered else existing
+                    },
+                ),
+            )
+        }
+
+    @Synchronized
+    fun moveTrackInLibrary(trackId: String, destinationIndex: Int): LibrarySnapshot = synchronized(importArtifactLock) {
+        val current = load()
+        val reordered = current.moveTrack(trackId, destinationIndex)
+        if (reordered === current) current else persist(reordered)
+    }
+
+    @Synchronized
     fun removePlaylist(playlistId: String): LibrarySnapshot = synchronized(importArtifactLock) {
-        persist(load().removePlaylist(playlistId))
+        val current = load()
+        val removed = current.playlists.firstOrNull { it.id == playlistId } ?: return@synchronized current
+        val updated = persist(current.removePlaylist(playlistId))
+        removed.artworkPath?.let { artworkPath ->
+            if (updated.playlists.none { it.artworkPath == artworkPath }) {
+                runCatching { deleteOwnedPlaylistArtworkFile(removed.id, artworkPath) }
+                    .onFailure { playlistArtworkOrphanSweepComplete = false }
+            }
+        }
+        updated
     }
 
     @Synchronized
@@ -711,6 +782,63 @@ class LocalLibraryRepository internal constructor(
         savedSnapshot
     }
 
+    @Synchronized
+    fun setPlaylistArtwork(playlistId: String, input: InputStream): LibrarySnapshot = synchronized(importArtifactLock) {
+        val current = load()
+        val existingPlaylist = current.playlists.firstOrNull { it.id == playlistId }
+            ?: throw IOException("The selected collection is no longer in the local library.")
+        val importedPath = input.use { playlistArtworkImporter.importPlaylistArtwork(playlistId, it) }
+        val newArtworkPath = canonicalOwnedPlaylistArtworkPath(playlistId, importedPath)
+        val requestedSnapshot = current.copy(
+            playlists = current.playlists.map { playlist ->
+                if (playlist.id == playlistId) playlist.copy(artworkPath = newArtworkPath) else playlist
+            },
+        )
+        val normalizedPlaylist = normalize(requestedSnapshot).playlists.firstOrNull { it.id == playlistId }
+        if (normalizedPlaylist?.artworkPath != newArtworkPath) {
+            if (newArtworkPath != existingPlaylist.artworkPath) {
+                deleteOwnedPlaylistArtworkFile(playlistId, newArtworkPath)
+            }
+            throw IOException("The selected cover image could not be added to the collection.")
+        }
+
+        val savedSnapshot = try {
+            persist(requestedSnapshot)
+            val readback = load()
+            if (readback.playlists.firstOrNull { it.id == playlistId }?.artworkPath != newArtworkPath) {
+                throw IOException("The updated collection cover could not be read back from the local library.")
+            }
+            readback
+        } catch (error: Exception) {
+            val stateAfterFailure = runCatching { load() }.getOrNull()
+            val replacementIsCommitted = stateAfterFailure?.playlists
+                ?.firstOrNull { it.id == playlistId }
+                ?.artworkPath == newArtworkPath
+            if (replacementIsCommitted) {
+                if (existingPlaylist.artworkPath != newArtworkPath &&
+                    stateAfterFailure.playlists.none { it.artworkPath == existingPlaylist.artworkPath }
+                ) {
+                    runCatching { deleteOwnedPlaylistArtworkFile(playlistId, existingPlaylist.artworkPath) }
+                }
+                return@synchronized requireNotNull(stateAfterFailure)
+            }
+            if (stateAfterFailure != null &&
+                stateAfterFailure.playlists.none { it.artworkPath == newArtworkPath } &&
+                newArtworkPath != existingPlaylist.artworkPath
+            ) {
+                runCatching { deleteOwnedPlaylistArtworkFile(playlistId, newArtworkPath) }
+            }
+            throw error
+        }
+
+        if (existingPlaylist.artworkPath != newArtworkPath &&
+            savedSnapshot.playlists.none { it.artworkPath == existingPlaylist.artworkPath }
+        ) {
+            runCatching { deleteOwnedPlaylistArtworkFile(playlistId, existingPlaylist.artworkPath) }
+        }
+        savedSnapshot
+    }
+
     private fun decodeStoredSnapshot(encoded: String?): LibrarySnapshot {
         if (encoded == null) return LibrarySnapshot()
         val stored = LibraryStateCodec.decode(encoded)
@@ -718,7 +846,34 @@ class LocalLibraryRepository internal constructor(
         return LibraryStateCodec.requireNoDataLoss(stored, normalized)
     }
 
-    private fun cleanupAbandonedImportArtifacts(snapshot: LibrarySnapshot): Boolean {
+    private fun cleanupAbandonedImportArtifacts(
+        snapshot: LibrarySnapshot,
+        onlyStableTrackId: String? = null,
+    ): Boolean = cleanupUnreferencedGeneratedAudioArtifacts(
+        snapshot = snapshot,
+        isOwnedGeneratedName = ::isAbandonedImportArtifactName,
+        onlyStableTrackId = onlyStableTrackId,
+    )
+
+    private fun cleanupOrphanPlaylistArtwork(snapshot: LibrarySnapshot): Boolean =
+        cleanupUnreferencedGeneratedAudioArtifacts(
+            snapshot = snapshot,
+            isOwnedGeneratedName = { fileName ->
+                PlaylistArtworkFileName.playlistIdFromGeneratedFileName(fileName) != null
+            },
+        )
+
+    private fun cleanupPlaylistArtworkOrphansOnce(snapshot: LibrarySnapshot) {
+        if (playlistArtworkOrphanSweepComplete) return
+        playlistArtworkOrphanSweepComplete =
+            runCatching { cleanupOrphanPlaylistArtwork(snapshot) }.getOrDefault(false)
+    }
+
+    private fun cleanupUnreferencedGeneratedAudioArtifacts(
+        snapshot: LibrarySnapshot,
+        isOwnedGeneratedName: (String) -> Boolean,
+        onlyStableTrackId: String? = null,
+    ): Boolean {
         val root = audioDirectory
         if (Files.isSymbolicLink(root.toPath())) return false
         if (!root.exists()) return true
@@ -727,15 +882,18 @@ class LocalLibraryRepository internal constructor(
         val referencedPaths = runCatching {
             snapshot.tracks
                 .flatMap { track -> listOfNotNull(track.filePath, track.artworkPath) }
+                .plus(snapshot.playlists.mapNotNull { playlist -> playlist.artworkPath })
                 .mapTo(hashSetOf()) { path -> File(path).canonicalPath }
         }.getOrNull() ?: return false
         val children = root.listFiles() ?: return false
         var complete = true
+        var directoryEntriesChanged = false
 
         for (candidate in children) {
             val candidatePath = candidate.toPath()
             try {
-                if (!isAbandonedImportArtifactName(candidate.name)) continue
+                if (!isOwnedGeneratedName(candidate.name)) continue
+                if (onlyStableTrackId != null && !isAbandonedImportArtifactForTrackId(candidate.name, onlyStableTrackId)) continue
                 if (Files.isSymbolicLink(candidatePath)) continue
                 if (!Files.isRegularFile(candidatePath, LinkOption.NOFOLLOW_LINKS)) continue
                 if (!PrivateAudioPath.isDirectChild(root, candidate)) {
@@ -758,12 +916,31 @@ class LocalLibraryRepository internal constructor(
                     complete = false
                     continue
                 }
-                Files.deleteIfExists(candidatePath)
+                if (Files.deleteIfExists(candidatePath)) directoryEntriesChanged = true
+            } catch (_: Exception) {
+                complete = false
+            }
+        }
+        if (directoryEntriesChanged) {
+            try {
+                durability.syncDirectory(root)
             } catch (_: Exception) {
                 complete = false
             }
         }
         return complete
+    }
+
+    private fun isAbandonedImportArtifactForTrackId(fileName: String, trackId: String): Boolean {
+        if (fileName.endsWith(".part")) return fileName.removeSuffix(".part") == trackId
+        if (fileName.endsWith(".img")) {
+            val stem = fileName.removeSuffix(".img")
+            return stem.substringBefore("-cover-") == trackId && isAbandonedImportArtifactName(fileName)
+        }
+        val extensionSeparator = fileName.lastIndexOf('.')
+        return extensionSeparator > 0 &&
+            fileName.substring(0, extensionSeparator) == trackId &&
+            isAbandonedImportArtifactName(fileName)
     }
 
     private fun isAbandonedImportArtifactName(fileName: String): Boolean {
@@ -792,9 +969,22 @@ class LocalLibraryRepository internal constructor(
             .distinctBy(Playlist::id)
             .distinctBy { it.name.trim().lowercase(Locale.ROOT) }
             .map { playlist ->
+                val artworkPath = playlist.artworkPath?.let { rawPath ->
+                    val artworkFile = File(rawPath)
+                    if (PlaylistArtworkFileName.isGeneratedFileName(playlist.id, artworkFile.name) &&
+                        !Files.isSymbolicLink(artworkFile.toPath()) &&
+                        Files.isRegularFile(artworkFile.toPath(), LinkOption.NOFOLLOW_LINKS) &&
+                        isOwnedAudioFile(artworkFile)
+                    ) {
+                        artworkFile.canonicalPath
+                    } else {
+                        null
+                    }
+                }
                 playlist.copy(
                     name = playlist.name.trim().take(MAX_PLAYLIST_NAME_LENGTH),
                     trackIds = playlist.trackIds.filter { it in knownTrackIds }.distinct(),
+                    artworkPath = artworkPath,
                 )
             }
         val favorites = snapshot.favoriteTrackIds.filterTo(hashSetOf()) { it in knownTrackIds }
@@ -829,6 +1019,18 @@ class LocalLibraryRepository internal constructor(
             !isOwnedAudioFile(file)
         ) {
             throw SecurityException("The selected cover was not stored as an owned private image.")
+        }
+        return file.canonicalPath
+    }
+
+    private fun canonicalOwnedPlaylistArtworkPath(playlistId: String, path: String): String {
+        val file = File(path)
+        if (!PlaylistArtworkFileName.isGeneratedFileName(playlistId, file.name) ||
+            Files.isSymbolicLink(file.toPath()) ||
+            !Files.isRegularFile(file.toPath(), LinkOption.NOFOLLOW_LINKS) ||
+            !isOwnedAudioFile(file)
+        ) {
+            throw SecurityException("The selected collection cover was not stored as an owned private image.")
         }
         return file.canonicalPath
     }
@@ -1002,6 +1204,23 @@ class LocalLibraryRepository internal constructor(
     private fun deleteOwnedArtworkFileEntry(trackId: String, path: String?): File? {
         val artworkFile = path?.let(::File) ?: return null
         if (!TrackArtworkFileName.isGeneratedFileName(trackId, artworkFile.name) ||
+            Files.isSymbolicLink(artworkFile.toPath()) ||
+            !Files.isRegularFile(artworkFile.toPath(), LinkOption.NOFOLLOW_LINKS) ||
+            !isOwnedAudioFile(artworkFile)
+        ) return null
+        return if (Files.deleteIfExists(artworkFile.toPath())) artworkFile else null
+    }
+
+    private fun deleteOwnedPlaylistArtworkFile(playlistId: String, path: String?) {
+        val artworkFile = deleteOwnedPlaylistArtworkFileEntry(playlistId, path) ?: return
+        val parent = artworkFile.parentFile ?: throw IOException("A private collection artwork file has no parent directory.")
+        durability.syncDirectory(parent)
+        cleanupEmptyRestoreGeneration(parent)
+    }
+
+    private fun deleteOwnedPlaylistArtworkFileEntry(playlistId: String, path: String?): File? {
+        val artworkFile = path?.let(::File) ?: return null
+        if (!PlaylistArtworkFileName.isGeneratedFileName(playlistId, artworkFile.name) ||
             Files.isSymbolicLink(artworkFile.toPath()) ||
             !Files.isRegularFile(artworkFile.toPath(), LinkOption.NOFOLLOW_LINKS) ||
             !isOwnedAudioFile(artworkFile)

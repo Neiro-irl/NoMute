@@ -24,6 +24,10 @@ internal fun interface AudioTrackImporter {
     fun import(input: InputStream, displayName: String, mimeType: String?): Track
 }
 
+internal interface StableIdAudioTrackImporter : AudioTrackImporter {
+    fun importWithId(input: InputStream, displayName: String, mimeType: String?, id: String): Track
+}
+
 internal class AndroidAudioDocumentSource(private val resolver: () -> ContentResolver) : AudioDocumentSource {
     override fun open(uri: Uri): AudioImportDocument {
         val contentResolver = resolver()

@@ -51,7 +51,8 @@ fun HomeScreen(
     onImport: () -> Unit,
     onOpenLibrary: () -> Unit,
     onOpenCollections: () -> Unit,
-    onPlayTracks: (List<Track>, String) -> Unit,
+    onPlayTrack: (String) -> Unit,
+    onAddToQueue: (Track) -> Unit,
     onToggleFavorite: (String) -> Unit,
     onAddToCollection: (String) -> Unit,
     onRemoveFromDevice: (Track) -> Unit,
@@ -116,7 +117,7 @@ fun HomeScreen(
             }
         } else {
             item {
-                SpotlightCard(track = spotlight, onClick = { onPlayTracks(recentTracks, spotlight.id) })
+                SpotlightCard(track = spotlight, onClick = { onPlayTrack(spotlight.id) })
             }
             item {
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -144,7 +145,8 @@ fun HomeScreen(
                     TrackRow(
                         track = track,
                         isFavorite = track.id in library.favoriteTrackIds,
-                        onClick = { onPlayTracks(recentTracks, track.id) },
+                        onClick = { onPlayTrack(track.id) },
+                        onAddToQueue = { onAddToQueue(track) },
                         onToggleFavorite = { onToggleFavorite(track.id) },
                         onAddToCollection = { onAddToCollection(track.id) },
                         onRemoveFromDevice = { onRemoveFromDevice(track) },

@@ -75,12 +75,18 @@ internal class LocalAudioImporter(
     private val metadataReader: AudioMetadataReader,
     private val availableBytes: () -> Long,
     private val durability: AudioImportDurability = AndroidAudioImportDurability,
-) : AudioTrackImporter {
+) : StableIdAudioTrackImporter {
     override fun import(input: InputStream, displayName: String, mimeType: String?): Track =
-        input.use { source -> importOpenedStream(source, displayName, mimeType) }
+        importWithId(input, displayName, mimeType, UUID.randomUUID().toString())
 
-    private fun importOpenedStream(input: InputStream, displayName: String, mimeType: String?): Track {
-        val id = UUID.randomUUID().toString()
+    override fun importWithId(input: InputStream, displayName: String, mimeType: String?, id: String): Track {
+        require(runCatching { UUID.fromString(id).toString() == id }.getOrDefault(false)) {
+            "The local import ID is invalid."
+        }
+        return input.use { source -> importOpenedStream(source, displayName, mimeType, id) }
+    }
+
+    private fun importOpenedStream(input: InputStream, displayName: String, mimeType: String?, id: String): Track {
         val fileNameFromDocument = TrackFileName.forImport(id, displayName, mimeType)
         if (fileNameFromDocument == null && !canProbeByContent(mimeType)) {
             throw IllegalArgumentException("Choose a supported audio file.")

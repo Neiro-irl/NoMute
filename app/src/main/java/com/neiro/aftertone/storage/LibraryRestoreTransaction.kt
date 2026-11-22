@@ -2,6 +2,8 @@ package com.neiro.aftertone.storage
 
 import com.neiro.aftertone.model.LibrarySnapshot
 import com.neiro.aftertone.model.LibraryStateCodec
+import com.neiro.aftertone.model.Playlist
+import com.neiro.aftertone.model.PlaylistArtworkFileName
 import com.neiro.aftertone.model.PrivateAudioPath
 import com.neiro.aftertone.model.Track
 import com.neiro.aftertone.model.TrackArtworkFileName
@@ -21,6 +23,7 @@ import java.nio.file.LinkOption
 import java.nio.file.NoSuchFileException
 import java.nio.file.Path
 import java.nio.file.SecureDirectoryStream
+import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
 import java.nio.file.attribute.BasicFileAttributeView
 import java.nio.charset.CodingErrorAction
@@ -130,8 +133,25 @@ internal class LibraryRestoreTransaction(
         val assets = validateStagedAssets(stagingDirectory, prepared)
         assets.forEach { asset ->
             checkCancelled()
-            val file = File(stagingDirectory, asset.entryName.substringAfter('/'))
+            val file = File(stagingDirectory, stagingFileName(asset.entryName))
             FileOutputStream(file, true).use(durability::syncFile)
+        }
+        val restoredFileNameByEntry = assets.associate { asset ->
+            checkCancelled()
+            val sourceName = stagingFileName(asset.entryName)
+            val restoredName = generationFileName(asset.entryName, transactionId)
+            if (sourceName != restoredName) {
+                val source = File(stagingDirectory, sourceName)
+                val destination = File(stagingDirectory, restoredName)
+                require(
+                    PrivateAudioPath.isDirectChild(stagingDirectory, source) &&
+                        PrivateAudioPath.isDirectChild(stagingDirectory, destination) &&
+                        Files.isRegularFile(source.toPath(), LinkOption.NOFOLLOW_LINKS) &&
+                        !Files.exists(destination.toPath(), LinkOption.NOFOLLOW_LINKS),
+                ) { "The playlist artwork staging file is not safe to rename." }
+                Files.move(source.toPath(), destination.toPath(), StandardCopyOption.ATOMIC_MOVE)
+            }
+            asset.entryName to restoredName
         }
         durability.syncDirectory(stagingDirectory)
         val expectedNames = assets.map { it.entryName }.toSet()
@@ -140,7 +160,7 @@ internal class LibraryRestoreTransaction(
         }
         val integrity = assets.map { asset ->
             checkCancelled()
-            val fileName = asset.entryName.substringAfter('/')
+            val fileName = restoredFileNameByEntry.getValue(asset.entryName)
             val digest = prepared.assetSha256ByEntry[asset.entryName]
                 ?: sha256(File(stagingDirectory, fileName), checkCancelled)
             require(SHA256_PATTERN.matches(digest)) { "The restored file integrity record is invalid." }
@@ -153,7 +173,7 @@ internal class LibraryRestoreTransaction(
         if (!PrivateAudioPath.isDirectChild(audioDirectory, generationDirectory) || generationDirectory.exists()) {
             throw SecurityException("The restore destination is not a new private directory.")
         }
-        val restoredSnapshot = remapToGeneration(prepared.snapshot, generationDirectory)
+        val restoredSnapshot = remapToGeneration(prepared.snapshot, generationDirectory, transactionId)
         val encodedState = LibraryStateCodec.encode(restoredSnapshot)
         val pending = PendingLibraryRestore(
             transactionId = transactionId,
@@ -477,6 +497,15 @@ internal class LibraryRestoreTransaction(
                 expectedNames += artwork.name
             }
         }
+        snapshot.playlists.forEach { playlist ->
+            playlist.artworkPath?.let { path ->
+                val artwork = File(path)
+                if (!PrivateAudioPath.isDirectChild(generation, artwork) ||
+                    !PlaylistArtworkFileName.isGeneratedFileName(playlist.id, artwork.name)
+                ) return false
+                expectedNames += artwork.name
+            }
+        }
         val records = journal.integrity.associateBy(RestoredAssetIntegrity::fileName)
         if (records.size != journal.integrity.size || records.keys != expectedNames) return false
         return journal.integrity.all { record ->
@@ -512,20 +541,41 @@ internal class LibraryRestoreTransaction(
                 "The restored library contains an invalid audio reference."
             }
             val audio = File(stagingDirectory, portableFileName(track.filePath, "audio/"))
-            require(PrivateAudioPath.isDirectChild(stagingDirectory, audio) && audio.isFile) {
+            require(
+                PrivateAudioPath.isDirectChild(stagingDirectory, audio) &&
+                    Files.isRegularFile(audio.toPath(), LinkOption.NOFOLLOW_LINKS),
+            ) {
                 "The restored audio file is missing from staging."
             }
             assets += LibraryBackupAsset(track.filePath, audio.length())
             track.artworkPath?.let { artworkPath ->
                 require(artworkPath == "artwork/${track.id}.img") { "The restored library contains an invalid artwork reference." }
                 val artwork = File(stagingDirectory, portableFileName(artworkPath, "artwork/"))
-                require(PrivateAudioPath.isDirectChild(stagingDirectory, artwork) && artwork.isFile) {
+                require(
+                    PrivateAudioPath.isDirectChild(stagingDirectory, artwork) &&
+                        Files.isRegularFile(artwork.toPath(), LinkOption.NOFOLLOW_LINKS),
+                ) {
                     "The restored artwork is missing from staging."
                 }
                 assets += LibraryBackupAsset(artworkPath, artwork.length())
             }
         }
-        val expectedNames = assets.map { it.entryName.substringAfter('/') }.toSet() + OWNER_MARKER
+        prepared.snapshot.playlists.forEach { playlist ->
+            playlist.artworkPath?.let { artworkPath ->
+                require(artworkPath == "playlist-artwork/${playlist.id}.img") {
+                    "The restored library contains an invalid playlist artwork reference."
+                }
+                val artwork = File(stagingDirectory, stagingFileName(artworkPath))
+                require(
+                    PrivateAudioPath.isDirectChild(stagingDirectory, artwork) &&
+                        Files.isRegularFile(artwork.toPath(), LinkOption.NOFOLLOW_LINKS),
+                ) {
+                    "The restored playlist artwork is missing from staging."
+                }
+                assets += LibraryBackupAsset(artworkPath, artwork.length())
+            }
+        }
+        val expectedNames = assets.map { stagingFileName(it.entryName) }.toSet() + OWNER_MARKER
         val children = stagingDirectory.listFiles()?.toList() ?: throw IOException("Could not inspect restore staging files.")
         require(children.size == expectedNames.size && children.all { it.name in expectedNames }) {
             "Restore staging contains an unreferenced or unexpected file."
@@ -534,14 +584,19 @@ internal class LibraryRestoreTransaction(
             if (child.name == OWNER_MARKER) {
                 isOwnedMarker(stagingDirectory, child, PrivateAudioPath.restoreStageId(stagingDirectory.name)!!)
             } else {
-                child.isFile && PrivateAudioPath.isDirectChild(stagingDirectory, child)
+                Files.isRegularFile(child.toPath(), LinkOption.NOFOLLOW_LINKS) &&
+                    PrivateAudioPath.isDirectChild(stagingDirectory, child)
             }
         }) { "Restore staging contains an unsafe file." }
         return assets
     }
 
-    private fun remapToGeneration(snapshot: LibrarySnapshot, generationDirectory: File): LibrarySnapshot =
-        snapshot.copy(tracks = snapshot.tracks.map { track ->
+    private fun remapToGeneration(
+        snapshot: LibrarySnapshot,
+        generationDirectory: File,
+        transactionId: String,
+    ): LibrarySnapshot = snapshot.copy(
+        tracks = snapshot.tracks.map { track ->
             val audioName = portableFileName(track.filePath, "audio/")
             require(TrackFileName.isGeneratedFileName(track.id, audioName)) { "The restored library contains an invalid audio reference." }
             val audio = File(generationDirectory, audioName)
@@ -553,10 +608,27 @@ internal class LibraryRestoreTransaction(
                 }.canonicalPath
             }
             track.copy(filePath = audio.canonicalPath, artworkPath = artwork)
-        })
+        },
+        playlists = snapshot.playlists.map { playlist ->
+            val artwork = playlist.artworkPath?.let { path ->
+                require(path == "playlist-artwork/${playlist.id}.img") {
+                    "The restored library contains an invalid playlist artwork reference."
+                }
+                val fileName = PlaylistArtworkFileName.forCustomCover(playlist.id, transactionId)
+                File(generationDirectory, fileName).also {
+                    require(PrivateAudioPath.isDirectChild(generationDirectory, it)) {
+                        "The restore path is outside private storage."
+                    }
+                }.canonicalPath
+            }
+            playlist.copy(artworkPath = artwork)
+        },
+    )
 
     private fun cleanupReplacedFiles(previous: LibrarySnapshot, current: LibrarySnapshot): Boolean {
-        val currentPaths = current.tracks.flatMap { track -> listOfNotNull(track.filePath, track.artworkPath) }.toSet()
+        val currentPaths = current.tracks.flatMap { track -> listOfNotNull(track.filePath, track.artworkPath) }
+            .plus(current.playlists.mapNotNull { it.artworkPath })
+            .toSet()
         val changedDirectories = linkedMapOf<File, SecureDirectoryStream<Path>>()
         try {
             previous.tracks.forEach { track ->
@@ -567,6 +639,14 @@ internal class LibraryRestoreTransaction(
                 val artwork = track.artworkPath?.let(::File)
                 if (artwork != null && artwork.path !in currentPaths) {
                     if (!deleteOwnedPreviousFile(artwork, { isOwnedPreviousTrackArtwork(track, artwork) }, changedDirectories)) return false
+                }
+            }
+            previous.playlists.forEach { playlist ->
+                val artwork = playlist.artworkPath?.let(::File)
+                if (artwork != null && artwork.path !in currentPaths) {
+                    if (!deleteOwnedPreviousFile(artwork, { isOwnedPreviousPlaylistArtwork(playlist, artwork) }, changedDirectories)) {
+                        return false
+                    }
                 }
             }
             changedDirectories.forEach { (directory, openedDirectory) ->
@@ -624,7 +704,7 @@ internal class LibraryRestoreTransaction(
     private fun cleanupEmptyPreviousGenerations(previous: LibrarySnapshot): Boolean {
         val directories = previous.tracks.flatMap { track ->
             listOfNotNull(File(track.filePath).parentFile, track.artworkPath?.let { File(it).parentFile })
-        }.distinct()
+        }.plus(previous.playlists.mapNotNull { it.artworkPath?.let { File(it).parentFile } }).distinct()
         directories.forEach { directory ->
             val id = directory.name.removePrefix(GENERATION_PREFIX)
                 .takeIf { directory.name.startsWith(GENERATION_PREFIX) } ?: return@forEach
@@ -655,6 +735,12 @@ internal class LibraryRestoreTransaction(
 
     private fun isOwnedPreviousTrackArtwork(track: Track, file: File): Boolean =
         TrackArtworkFileName.isGeneratedFileName(track.id, file.name) &&
+            (PrivateAudioPath.isDirectChild(audioDirectory, file) ||
+                PrivateAudioPath.isOwnedRestoreFile(audioDirectory, file) ||
+                isMissingPreviousGenerationDirectory(file.parentFile))
+
+    private fun isOwnedPreviousPlaylistArtwork(playlist: Playlist, file: File): Boolean =
+        PlaylistArtworkFileName.isGeneratedFileName(playlist.id, file.name) &&
             (PrivateAudioPath.isDirectChild(audioDirectory, file) ||
                 PrivateAudioPath.isOwnedRestoreFile(audioDirectory, file) ||
                 isMissingPreviousGenerationDirectory(file.parentFile))
@@ -1098,6 +1184,7 @@ internal class LibraryRestoreTransaction(
     ): Boolean {
         val activeAudioPaths = try {
             snapshot.tracks.flatMap { track -> listOfNotNull(track.filePath, track.artworkPath) }
+                .plus(snapshot.playlists.mapNotNull { it.artworkPath })
                 .map { path -> File(path).toPath().toAbsolutePath().normalize() }
                 .toSet()
         } catch (_: Exception) {
@@ -1269,6 +1356,24 @@ internal class LibraryRestoreTransaction(
         }.isSuccess
     }
 
+    private fun stagingFileName(entryName: String): String {
+        if (!entryName.startsWith("playlist-artwork/")) return entryName.substringAfter('/')
+        val playlistId = entryName.removePrefix("playlist-artwork/").removeSuffix(".img")
+        require(PlaylistArtworkFileName.isSafePlaylistId(playlistId) && entryName == "playlist-artwork/$playlistId.img") {
+            "The restored library contains an unsafe playlist artwork path."
+        }
+        return ".playlist-artwork-$playlistId.img"
+    }
+
+    private fun generationFileName(entryName: String, transactionId: String): String {
+        if (!entryName.startsWith("playlist-artwork/")) return entryName.substringAfter('/')
+        val playlistId = entryName.removePrefix("playlist-artwork/").removeSuffix(".img")
+        require(PlaylistArtworkFileName.isSafePlaylistId(playlistId) && entryName == "playlist-artwork/$playlistId.img") {
+            "The restored library contains an unsafe playlist artwork path."
+        }
+        return PlaylistArtworkFileName.forCustomCover(playlistId, transactionId)
+    }
+
     private fun isOwnedStagingDirectory(directory: File, id: String): Boolean =
         PrivateAudioPath.restoreStageId(directory.name) == id &&
             PrivateAudioPath.isDirectChild(audioDirectory, directory) && directory.isDirectory &&
@@ -1279,6 +1384,11 @@ internal class LibraryRestoreTransaction(
 
     private fun isSafeStagedAssetName(name: String): Boolean {
         if (name == OWNER_MARKER || '/' in name || '\\' in name) return false
+        if (PlaylistArtworkFileName.playlistIdFromGeneratedFileName(name) != null) return true
+        val stagingPrefix = ".playlist-artwork-"
+        if (name.startsWith(stagingPrefix) && name.endsWith(".img")) {
+            return PlaylistArtworkFileName.isSafePlaylistId(name.removePrefix(stagingPrefix).removeSuffix(".img"))
+        }
         val id = name.substringBeforeLast('.', missingDelimiterValue = "")
         if (id.isEmpty() || !id.matches(Regex("[A-Za-z0-9_-]{1,80}"))) return false
         return TrackFileName.isGeneratedFileName(id, name) || name == "$id.img"
